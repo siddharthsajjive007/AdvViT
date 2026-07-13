@@ -21,6 +21,12 @@ unloader = T.ToPILImage()
 
 device = torch.device('cuda',0)
 
+# Base directory for all saved artifacts (ori/adv/prub images).
+# Fixed from the original hardcoded 'D:\\zc\\simple-patch-master-plus\\save\\...'
+# which only existed on the authors' Windows machine.
+SAVE_BASE = '/home/siddharthsajjive/AdvViT/save'
+
+
 class SimP:
     
     def __init__(self, model, dataset, image_size, k=200):
@@ -49,26 +55,41 @@ class SimP:
         output = self.model(self.normalize(x.to(device))).cpu()
         _, preds = output.data.max(1)
         return preds'''
-    
-    def get_results(self, x):
-        x=self.normalize(x.to(device))
-        ########## Vision Transformers
-        class_prob, atten = self.model(x)     
-        ##########  CNNs
-        #class_prob = self.model(x)     
 
+    def _forward_logits(self, x):
+        """
+        Runs the model and returns just the classification logits.
+
+        Handles both model families used in this repo:
+          - ViT-style models (DeiT via models/vision_transformer.py) whose
+            forward() returns a (logits, attention_list) tuple.
+          - CNN-style models (models/resnet.py) whose forward() returns a
+            plain logits Tensor.
+
+        The original code assumed every model returns a 2-tuple
+        (`class_prob, atten = self.model(x)`), which breaks for ResNet
+        (forward() returns a single Tensor there) either with a
+        "too many values to unpack" error, or silently mis-splitting a
+        batch if batch size happens to equal 2. This makes the unpacking
+        conditional on what the model actually returns.
+        """
+        output = self.model(x)
+        if isinstance(output, (tuple, list)):
+            return output[0]
+        return output
+
+    def get_results(self, x):
+        x = self.normalize(x.to(device))
+        class_prob = self._forward_logits(x)
         img_class = class_prob.max(1)[1]
-        prob = torch.max(torch.softmax(class_prob[0],dim=0))
+        prob = torch.max(torch.softmax(class_prob[0], dim=0))
+        
         return img_class, prob
 
     def get_label(self, x):
-        x=self.normalize(x.to(device))
-        ########## Vision Transformers
-        class_prob, atten = self.model(x)     
-        ##########  CNNs        
-        #class_prob = self.model(x)
+        x = self.normalize(x.to(device))
+        class_prob = self._forward_logits(x)
         img_class = class_prob.max(1)[1]
-        prob = torch.max(torch.softmax(class_prob[0],dim=0))
         return img_class
 
     # 20-line implementation of SimBA for single image input
@@ -97,19 +118,19 @@ class SimP:
     # (for targeted attack) <labels_batch>
 
     def generate_adv(self, x0, patch_num,dct_theta):
-        x = np.array(x0.clone())
+        x = np.array(x0.clone())                        #[3,224,224]
         x_dct = self.DCT_trans(x, patch_num)
-        adv = self.IDCT_trans(x_dct + dct_theta,patch_num)
-        patch_size = int(224/patch_num)
+        adv = self.IDCT_trans(x_dct + dct_theta,patch_num)     #IDCT of x_0(dct) + variance, alpha scaled gaussian direction [3,224,224]
+        patch_size = int(224/patch_num)                         #pixel length of each patch
         if 224 % patch_num !=0:
             adv[:,0:224,patch_num*patch_size:224] = x0[:,0:224,patch_num*patch_size:224]
-            adv[:,patch_num*patch_size:224,0:224] = x0[:,patch_num*patch_size:224,0:224]
+            adv[:,patch_num*patch_size:224,0:224] = x0[:,patch_num*patch_size:224,0:224]     #if ori length is not divisible exactly by patch length , the remaining length or height values are populated from the original image
         #adv = self.IDCT_trans(x_dct,patch_num)
         adv = torch.tensor(adv, dtype=torch.float)
         adv = adv.clamp(0, 1)
         #adv = adv.unsqueeze(0)
-        prub = adv - x0
-        return adv,prub
+        prub = adv - x0                                           #[3,224,224]
+        return adv,prub                                      # returns the adversarial image and perturbation made
 
 
     def simp_batch(self, images_batch, labels_batch, patch_size, max_iters, num, epsilon=0.0, linf_bound=0.0,
@@ -119,9 +140,17 @@ class SimP:
 
         patch_num = int(image_size / patch_size)
         #patch_num = patch_num * patch_num
-        ori_path = 'D:\\zc\\simple-patch-master-plus\\save\\ori'
-        adv_path = 'D:\\zc\\simple-patch-master-plus\\save\\adv'
-        prub_path = 'D:\\zc\\simple-patch-master-plus\\save\\prub'
+
+        # Fixed: these used to be hardcoded to the authors' Windows machine
+        # ('D:\\zc\\simple-patch-master-plus\\save\\...'), which don't exist
+        # on WSL and would crash on the first .save() call. Now they live
+        # under the repo's own save/ directory and are created if missing.
+        ori_path = os.path.join(SAVE_BASE, 'ori')
+        adv_path = os.path.join(SAVE_BASE, 'adv')
+        prub_path = os.path.join(SAVE_BASE, 'prub')
+        os.makedirs(ori_path, exist_ok=True)
+        os.makedirs(adv_path, exist_ok=True)
+        os.makedirs(prub_path, exist_ok=True)
 
         for n in range(batch_size):
             ##################save original image#######################
@@ -150,76 +179,86 @@ class SimP:
         return adv, distortion, is_success, nqueries, prub
     
     def attack_untargeted(self, x0, y0, ori_probal, patch_num, alpha = 0.2, beta = 0.001, iterations = 1000, query_limit=4000,
-                          distortion=None, svm=False, momentum=0.0, stopping=0.0001):
+                          distortion=None, svm=False, momentum=0.0, stopping=0.0001, use_sign_opt_plus=False):
+        """
+        use_sign_opt_plus=False (default): plain Sign-OPT line search (AdvViT / "AD").
+        use_sign_opt_plus=True: adds the Sign-OPT+ gate (Ran & Wang 2022) before each
+                                binary search in the line-search loop -- one cheap query at the current
+                                best DCT-scale (gg_dct) checks whether a candidate direction even succeeds
+                                before paying for the full fine_grained_binary_search_local call. This is
+                                the AdvViT+ / "AD+" variant.
+
+        """
+        #success_thold = 5.0
+        #best_zero_num = 0
+
         model = self.model
         query_count = 0
         ls_total = 0
-        success_thold = 5.0
-        best_zero_num = 0
+
         num_directions = 100
         dimen_size = 4
-        alp = 4
+        alp = 4  #alpha (scaling factor)
         success_flag = False
-        best_theta_dct, g_theta, g_dct  = None, float('inf'), float('inf')
+        best_theta_dct, g_theta, g_dct  = None, float('inf'), float('inf') 
+        # g_dct is the lambda value
+
         print("Searching for the initial direction on %d random directions: " % (num_directions))
-        #dct_mask = np.ones_like(x0.cpu())        
+         
         #####################################################################
-        '''dct_mask = np.zeros_like(x0.cpu())
-        for j in range(patch_num):
-            for k in range(patch_num):
-                dct_mask[:,j*16:j*16+3,k*16:k*16+3] = 1'''
-        patch_size = int(224/patch_num)
-        dct_mask = self.Mask_weight(x0, dimen_size,alp,patch_size)
-        dct_mask = dct_mask.squeeze(0)
+        patch_size = int(224/patch_num)                                 #int
+        dct_mask = self.Mask_weight(x0, dimen_size,alp,patch_size)  
+        print(f"Dct mask:{dct_mask.shape}")                             #[1, 3, 224, 224]
+        dct_mask = dct_mask.squeeze(0)                                  #[3, 224, 224]
         #####################################################################
         for i in range(num_directions):
             query_count += 1
-            x0 = x0.cpu().clone()
-            dct_theta = np.random.randn(*np.array(x0).shape) # gaussian distortion
-            dct_theta = dct_theta * dct_mask
-            #print(dct_theta)
-            #print(np.count_nonzero(dct_theta))
-
-            adv, prub= self.generate_adv(x0,patch_num,dct_theta * dct_mask)
-            # register adv directions
-            adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))
-            if adv_class != y0:
+            x0 = x0.cpu().clone()                                       #[3, 224, 224]
+            dct_theta = np.random.randn(*np.array(x0).shape)            # gaussian distortion [3, 224, 224]
+            dct_theta = dct_theta * dct_mask                            # (theta' = theta * mask) gaussian direction mask scaled with variance and alpha and allows only top left corner for each patch 
+            
+            adv, prub= self.generate_adv(x0,patch_num,dct_theta)                   #returns adversarial image by doing idct (x_0(dct) + dct theta)            # register adv directions
+            adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))    #class number and softmax probability
+            if adv_class != y0:                                                    # if adversarial (NOT ORIGINAL LABEL)
                 success_flag = True
-                initial_lbd_dct = LA.norm(dct_theta)
-                initial_l2 = LA.norm(prub)
+                initial_lbd_dct = LA.norm(dct_theta)                    #magnitude of the random direction (DCT space)
+                initial_l2 = LA.norm(prub)                              #magnitude of actual distance between ori and adv
 
-                prub /= initial_l2 # l2 normalize
-                dct_theta /= initial_lbd_dct
+                prub /= initial_l2                                      # normalized distance vector b/w ori and adv
+                dct_theta /= initial_lbd_dct                            # (theta' / ||theta'||)  dct l2 normalized
                 lbd_dct, lbd_l2, count = self.fine_grained_binary_search(model, x0, y0, patch_num, dct_theta, initial_l2,  initial_lbd_dct, g_theta, g_dct)
-
-                query_count += count
-                if lbd_l2 < g_theta:
-                    g_theta, best_theta_dct, g_dct  = lbd_l2, dct_theta, lbd_dct
+                #RETURNS CONVERGED BEST LBD_DCT (LAMBDA) AND L2 OF THE DIRECTION THAT HAS HAD BETTER RAW NORM THAN ALL THE PREVIOUS SELECTED DIRECTION
+                """
+                CONVERGED HERE MEANS THE DIRECTION WHICH IS OPTIMIZED ON LAMBDA BY BINARY SEARCH (LOWEST LAMBDA VALUE)
+                """
+                query_count += count   
+                if lbd_l2 < g_theta:                                   #CHECKS IF THE NEW CONVERGED POINT HAS LOWER RAW NORM THAN EARLIER BEST CONVERGED DIRECTION
+                    g_theta, best_theta_dct, g_dct  = lbd_l2, dct_theta, lbd_dct     #IF YES, THIS BECOMES THE BEST DIRECTION WITH BEST CONVERGED LAMBDA VALUE
                     print("--------> Found l2distortion %.4f,dctdistortion%.4f" % (g_theta, g_dct))
                     if round(g_theta, 3) == 0.000:
                         print("not need to be attacked")
-                        return x0.to(device), 0, True, query_count, torch.zeros(3,224,224)
+                        return x0.to(device), 0, True, query_count, torch.zeros(3,224,224)    
+            
             
         ###############################################################
-        if success_flag == False:
-            dct_mask = np.zeros_like(x0.cpu())
+        if success_flag == False:                            #(FALLBACK) IF NONE OF THE GENERATED DIRECTION FOOLS THE MODEL
             for j in range(patch_num):
                 for k in range(patch_num):
-                    dct_mask[:,j*16:j*16+dimen_size,k*16:k*16+dimen_size] = 1
+                    dct_mask[:,j*16:j*16+dimen_size,k*16:k*16+dimen_size] = 1      #SCRAPS THE ORIGINAL VARIANCE WEIGHTED MASK AND GIVES A SIMPLE 1 MASK
             for i in range(query_limit - query_count):
                 query_count += 1
                 dct_theta = np.random.randn(*np.array(x0).shape) # gaussian distortion
-                dct_theta = dct_theta * dct_mask
+                dct_theta = dct_theta * dct_mask                                         
 
-                adv, prub= self.generate_adv(x0,patch_num,dct_theta * dct_mask)
-                adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))
+                adv, prub= self.generate_adv(x0,patch_num,dct_theta)
+                adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))    #DOES THE SAME PROCESS AGAIN THIS TIME WITH A SIMPLE MASK 
                 if adv_class != y0:
                     success_flag = True
                     initial_lbd_dct = LA.norm(dct_theta)
                     initial_l2 = LA.norm(prub)
 
-                    prub /= initial_l2 # l2 normalize
-                    dct_theta /= initial_lbd_dct
+                    prub /= initial_l2 # l2 normalize                            
+                    dct_theta /= initial_lbd_dct                                        #SAME AS ABOVE
                     lbd_dct, lbd_l2, count = self.fine_grained_binary_search(model, x0, y0, patch_num, dct_theta, initial_l2,  initial_lbd_dct, g_theta, g_dct)
 
                     query_count += count
@@ -229,7 +268,7 @@ class SimP:
                     break                   
             ##########################################################
 
-        ## fail if cannot find a adv direction within 200 Gaussian
+        # fail if cannot find a adv direction within 200 Gaussian
         if g_theta == float('inf'):
             print("Couldn't find valid initial, failed")
             return x0.to(device), 0, False, query_count, torch.zeros(3,224,224)
@@ -240,44 +279,79 @@ class SimP:
               "using %d queries" % (g_theta,query_count))
 
         #### Begin Gradient Descent.
-        xg, gg, gg_dct = best_theta_dct, g_theta, g_dct#
-        vg = np.zeros_like(xg)
+        xg, gg, gg_dct = best_theta_dct, g_theta, g_dct#    #xg IS THE BEST (THETA'/||THETA'||), gg IS THE BEST RAW NORM (PRUB DISTANCE) AND gg_dct IS THE BEST LAMBDA FOR THE xg (LOWEST)
         distortions = [gg]
-        for i in range(iterations):
-            sign_gradient, grad_queries = self.sign_grad_v1(x0, y0, patch_num, xg, gg_dct, dct_mask, h=beta)
+        for i in range(iterations):                                                                                     # EACH ITERATION CREATES DIFFERENT SIGN GRADIENT
+            sign_gradient, grad_queries = self.sign_grad_v1(x0, y0, patch_num, xg, gg_dct, dct_mask, h=beta)            # RETURNS AVERAGE OF ALL mu(j) THAT NUDGED THETA' AND WAS ADVERSARIAL
             ls_count = 0
-            min_theta_dct = xg ## next theta
-            min_g2 = gg ## current g_theta
-            min_lbd_dct = gg_dct ## velocity (for momentum only)
+            min_theta_dct = xg             ## NEXT THETA'
+            min_g2 = gg                    ## CURRENT RAW NORM
+            min_lbd_dct = gg_dct           ## LAMBDA
             for _ in range(5):
-                new_theta_dct = xg - alpha * sign_gradient
-                new_theta_dct /= LA.norm(new_theta_dct)
+                new_theta_dct = xg - alpha * sign_gradient            #UPDATED THETA' IN EVERY INNER LOOP BY CHANGING ALPHA BY ADDING ALPHA SCALED mu(j) average (NEW THETA')
+                new_theta_dct /= LA.norm(new_theta_dct)               # NEW THETA' /|| NEW THETA'||  
 
-                new_lbd_dct, count = self.fine_grained_binary_search_local(
-                    model, x0, y0, patch_num, new_theta_dct, initial_lbd = min_g2, initial_lbd_dct = gg_dct,tol=beta/500)
-                ls_count += count
-                adv, prub= self.generate_adv(x0,patch_num,new_lbd_dct*new_theta_dct)
-                new_g2 = LA.norm(prub)                
+                if use_sign_opt_plus:
+                    # Sign-OPT+ gate: one cheap query at the CURRENT best-in-this-attempt-sequence
+                    # DCT-scale (min_lbd_dct, which tightens as better candidates are found within
+                    # this inner loop) before paying for fine_grained_binary_search_local's full
+                    # binary search. Using gg_dct here (fixed for the whole outer iteration) was a
+                    # bug -- it never tightened, weakening the efficiency gain within each iteration.
+                    adv_check, _ = self.generate_adv(x0, patch_num, min_lbd_dct * new_theta_dct)      # GENERATES ADV IMAGE WITH NEW THETA' (LAMBDA OF THE PREVIOUS SELECTED THETA DCT IS TRIED WITH NEW THETA DCT (NEW ALPHA)... SINCE THE NEW ALPHA IS JUST SCALING THE BASE DIRECTION, IT SHOULD WORK, SO THIS GATE IS A CHEAP FILTER AGAIN)
+                    check_class, _ = self.get_results(adv_check.unsqueeze(0).to(device))              # PREDICTS CLASS
+                    ls_count += 1
+                    if check_class != y0:                                                             # IF ADVERSARIAL        
+                        new_lbd_dct, count = self.fine_grained_binary_search_local(                   # DO FINE GRAINED BINARY SEARCH HERE WITH THE INITIAL LAMBDA VALUE, NOT PREVIOUS LIKE ABOVE AS WE WANT TO FIND THE BEST CONVERGED LAMBDA TO THIS NEW THETA DCT, SO INITIAL LAMBDA VALUE
+                            x0, y0, patch_num, new_theta_dct,  initial_lbd_dct = gg_dct, tol=beta/500)
+                        ls_count += count
+                        adv, prub= self.generate_adv(x0,patch_num,new_lbd_dct*new_theta_dct)          # GENERATE ADV IMAGE WITH NEW VALUES OF LAMBDA AND THETA DCT
+                        new_g2 = LA.norm(prub)                                                        # NEW RAW NORM
+                    else:
+                        new_lbd_dct, new_g2, count = min_lbd_dct, float('inf'), 0                     #IF NOT ADV, RAW NORM IS SET TO INFINITY
+                else:
+                    new_lbd_dct, count = self.fine_grained_binary_search_local(
+                        x0, y0, patch_num, new_theta_dct,  initial_lbd_dct = gg_dct,tol=beta/500)     # THIS ELSE BLOCK IS FOR SIGN-OPT INSTEAD OF PLUS
+                    ls_count += count
+                    adv, prub= self.generate_adv(x0,patch_num,new_lbd_dct*new_theta_dct)
+                    new_g2 = LA.norm(prub)
 
-                alpha = alpha * 2 # gradually increasing step size
+                alpha = min(alpha * 2, 1e6) # CORRECTION MADE FROM ORIGINAL FILE                      # ALPHA IS INCREASED BY 2 BUT NOT BEYOND 1E6 (1 MILLION)
+                                            # gradually increasing step size, capped to prevent
+                                            # overflow to inf on long runs of consecutive successes
+                                            # (unbounded doubling eventually overflows float precision,
+                                            # producing nan candidates and permanently disabling the
+                                            # alpha<1e-4 reset since inf is never < 1e-4)
                 if new_g2 < min_g2:
                     min_theta_dct = new_theta_dct
                     min_lbd_dct = new_lbd_dct
-                    min_g2 = new_g2
+                    min_g2 = new_g2                                    #UPDATES THE MIN LBD DCT TO CONVERGED LAMBDA FOR THE NEW THETA DCT THAT PRODUCES AN ADV IMAGE HAVING LESS RAW NORM THAN PREV SELECTED THETA DCT
                 else:
                     break
 
-            if min_g2 >= gg: ## if the above code failed for the init alpha, we then try to decrease alpha
-                for _ in range(5):
+            if min_g2 >= gg:                                            ## if the above code failed for the init alpha, we then try to decrease alpha
+                for _ in range(5):                                      #  THIS BLOCK DOES THE SAME THING AS ABOVE , BUT ONLY ACTIVATES IF THE FIRST ADV CHECK FOR FIRST ALPHA FAILS AND THE NEW G2 IS SET TO INFINITY (IN THAT CASE NEW MIN G2 IS UNCHANGED, THAT IS WHY >= IS CHECKED HERE)                                    
                     alpha = alpha * 0.25
                     new_theta_dct = xg - alpha * sign_gradient
                     new_theta_dct /= LA.norm(new_theta_dct)
 
-                    new_lbd_dct, count = self.fine_grained_binary_search_local(
-                        model, x0, y0, patch_num, new_theta_dct, initial_lbd = min_g2, initial_lbd_dct = gg_dct,tol=beta/500)
-                    ls_count += count
-                    adv, prub= self.generate_adv(x0,patch_num,new_lbd_dct*new_theta_dct)
-                    new_g2 = LA.norm(prub)
+                    if use_sign_opt_plus:
+                        adv_check, _ = self.generate_adv(x0, patch_num, min_lbd_dct * new_theta_dct)
+                        check_class, _ = self.get_results(adv_check.unsqueeze(0).to(device))
+                        ls_count += 1
+                        if check_class != y0:
+                            new_lbd_dct, count = self.fine_grained_binary_search_local(
+                                x0, y0, patch_num, new_theta_dct,  initial_lbd_dct = gg_dct,tol=beta/500)
+                            ls_count += count
+                            adv, prub= self.generate_adv(x0,patch_num,new_lbd_dct*new_theta_dct)
+                            new_g2 = LA.norm(prub)
+                        else:
+                            new_lbd_dct, new_g2, count = min_lbd_dct, float('inf'), 0
+                    else:
+                        new_lbd_dct, count = self.fine_grained_binary_search_local(
+                            x0, y0, patch_num, new_theta_dct,  initial_lbd_dct = gg_dct,tol=beta/500)
+                        ls_count += count
+                        adv, prub= self.generate_adv(x0,patch_num,new_lbd_dct*new_theta_dct)
+                        new_g2 = LA.norm(prub)
 
                     if new_g2 < gg:
                         min_theta_dct = new_theta_dct
@@ -305,13 +379,13 @@ class SimP:
         print("--------> sign opt attack  %.4f" % gg)
         adv, prub= self.generate_adv(x0,patch_num,gg_dct*xg)
 
-        return adv.unsqueeze(0).to(device), gg, True, query_count, adv-x0
+        return adv.unsqueeze(0).to(device), gg, True, query_count, adv-x0              # RETURNS FINAL ADV IMAGE, RAW NORM, QUERY COUNT AND PRUB
 
-    def fine_grained_binary_search_local(self, model, x0, y0,patch_num, theta_dct, initial_lbd = 1.0, initial_lbd_dct = 1.0, tol=5e-3):
+    def fine_grained_binary_search_local(self, x0, y0,patch_num, theta_dct, initial_lbd_dct = 1.0, tol=5e-3):
         nquery = 0
-        lbd = initial_lbd
+    
         lbd_dct = initial_lbd_dct
-        adv, prub = self.generate_adv(x0,patch_num,lbd_dct*theta_dct)
+        adv, _ = self.generate_adv(x0,patch_num,lbd_dct*theta_dct)
         adv_class = self.get_label(adv.unsqueeze(0).to(device))  
 
         if adv_class == y0:
@@ -329,7 +403,7 @@ class SimP:
             lbd_dct_lo = lbd_dct*0.99
             nquery += 1
             adv, prub = self.generate_adv(x0,patch_num,lbd_dct_lo*theta_dct)
-            while self.get_label(adv.unsqueeze(0).to(device)) != y0 :
+            while self.get_label(adv.unsqueeze(0).to(device)) != y0 :                      #THIS WHILE LOOP FINDS THE BEST BRACKET TP START FOR THE ACTUAL BINARY SEARCH (LOWEST LBD_DCT_LOW THAT JUST FAILS THE ADV CHECK)
                 lbd_dct_lo = lbd_dct_lo*0.99
                 nquery += 1
                 adv, prub = self.generate_adv(x0,patch_num,lbd_dct_lo*theta_dct)
@@ -337,9 +411,9 @@ class SimP:
                     break
 
         while (lbd_dct_hi - lbd_dct_lo) > tol:
-            lbd_dct_mid = (lbd_dct_lo + lbd_dct_hi)/2.0
+            lbd_dct_mid = (lbd_dct_lo + lbd_dct_hi)/2.0                                    #ACTUAL BINARY SEARCH TI FIND BEST LAMBDA
             nquery += 1
-            adv, prub = self.generate_adv(x0,patch_num,lbd_dct_mid*theta_dct)
+            adv, _ = self.generate_adv(x0,patch_num,lbd_dct_mid*theta_dct)
             adv_class = self.get_label(adv.unsqueeze(0).to(device))
             if adv_class != y0:
                 lbd_dct_hi = lbd_dct_mid
@@ -347,74 +421,83 @@ class SimP:
                 lbd_dct_lo = lbd_dct_mid
         return lbd_dct_hi, nquery
 
-    def sign_grad_v1(self, x0, y0, patch_num, theta_dct, initial_lbd_dct,dct_mask, h=0.001, D=4, target=None):
-    
+                                 
+
+    def sign_grad_v1(self, x0, y0, patch_num, theta_dct, initial_lbd_dct, dct_mask, h=0.001, target=None):
+                                                          #(best lambda)
         K = self.k #200
         sign_grad = np.zeros(theta_dct.shape)
         queries = 0
 
-        for iii in range(K): # for each u
-            u = np.random.randn(*theta_dct.shape)
-            u = u * dct_mask
-            u /= LA.norm(u)
-            new_theta_dct = theta_dct + h*u
-            new_theta_dct /= LA.norm(new_theta_dct)
+        for _ in range(K): # for each u
+            u = np.random.randn(*theta_dct.shape)   # mu(j)
+            u = u * dct_mask                        # mu(j) = mu(j)* M(mask)
+            u /= LA.norm(u)                         # normalized
+            new_theta_dct = theta_dct + h*u         # theta' + epsilon*mu(j)
+            new_theta_dct /= LA.norm(new_theta_dct) # normalized
             sign = 1
             #####################################################################            
             adv, prub = self.generate_adv(x0,patch_num,initial_lbd_dct*new_theta_dct)
             adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))  
             #####################################################################
-            if (target is not None and adv_class == target):
+            if (target is not None and adv_class == target):            #TARGETED ATTACK CHECK
                 sign = -1
 
             if (target is None and adv_class != y0): # success
-                sign = -1
+                sign = -1                             #if adversarial, sign = -1
 
-            queries += 1
-            sign_grad += u*sign
+            queries += 1                               
+            sign_grad += u*sign                        #add all the directions that nudges our best theta and makes image adversarial scaled by sign
         
-        sign_grad /= K
+        sign_grad /= K                                # (1/J) normalize the resultant nudge direction
         
         return sign_grad, queries
 
-    def Mask_weight(self, big_image, dimen_size,alp,patch_size)  :
-        #x_dct = np.zeros(*image.shape())
-        big_image = big_image.unsqueeze(0)
-        # 定义小图的大小和列数
+    def Mask_weight(self, big_image, dimen_size, alp, patch_size, use_variance_weight=True):
+        """
+        Builds the weight mask matrix M (Eq. 4-7 in the AdvViT paper).
+
+        use_variance_weight=True (default, matches the paper / AdvViT+):
+            Each patch's low-frequency r x r corner is scaled by
+            alpha * normalized_variance(patch), concentrating perturbation
+            budget on high-texture patches where it's visually less
+            noticeable, per Eq. 6-7 of the paper.
+
+        use_variance_weight=False (matches this repo's checked-out state,
+        i.e. paper's ablation "method B" in Table 5):
+            Every patch's low-frequency corner gets a flat value of 1,
+            with no variance weighting at all. This was the actual
+            behavior found in the uploaded snapshot (the variance line
+            was present but commented out).
+
+        Flip this flag if you specifically want to reproduce the
+        ablation numbers instead of the full AdvViT+ numbers.
+        """
+        big_image = big_image.unsqueeze(0)                     #[1,3,224,224]
         num_patches_per_row = int(224 // patch_size)
-
-        # 计算行数和总小图数量
         num_patches_per_col = num_patches_per_row
-        num_patches = num_patches_per_row * num_patches_per_col
 
-        # 提取小图，并计算每张小图的方差
-        #patches = np.zeros((num_patches, 1, 3, patch_size, patch_size))
         variances = []
         for i in range(num_patches_per_col):
             for j in range(num_patches_per_row):
                 patch = big_image[:, :, i * patch_size:(i + 1) * patch_size, j * patch_size:(j + 1) * patch_size]
-                #patches[i * num_patches_per_row + j] = patch
-                variance = torch.var(patch)  # 计算方差
-                variances.append(variance.cpu())
+                variance = torch.var(patch)
+                variances.append(variance.cpu())            
+        variances = np.array(variances)                        #len(variances) = 196
         max_var = np.max(variances)
-        min_var = np.min(variances)
-
-        # variances -= min_var
-        # variances /= (max_var - min_var) 
-        variances /= max_var
+        # Eq. 6: q'_i = q_i / max(Q) -- normalized per-patch variance
+        variances = variances / max_var
 
         dct_mask = np.zeros_like(big_image.cpu())
         for r in range(num_patches_per_row):
             for c in range(num_patches_per_col):
-                # if variances[r * num_patches_per_row + c] >= np.percentile(variances, 50):
-                #     dct_mask[:,:,r*16:r*16+dimen_size,c*16:c*16+dimen_size] = 1
-                # else:
-                #dct_mask[:,:,r*patch_size:r*patch_size+dimen_size,c*patch_size:c*patch_size+dimen_size] = variances[r * num_patches_per_row + c] * alp 
-                dct_mask[:,:,r*patch_size:r*patch_size+dimen_size,c*patch_size:c*patch_size+dimen_size] = 1 
-
-        # 输出结果
-        # print(patches.shape)  # (196, 1, 3, 16, 16)
-        # print(variances)  # 输出每张小图的方差值
+                idx = r * num_patches_per_row + c
+                if use_variance_weight:
+                    # Eq. 7: M = alpha * q'_i * (0/1 low-freq mask)
+                    dct_mask[:, :, r*patch_size:r*patch_size+dimen_size, c*patch_size:c*patch_size+dimen_size] = variances[idx] * alp
+                else:
+                    dct_mask[:, :, r*patch_size:r*patch_size+dimen_size, c*patch_size:c*patch_size+dimen_size] = 1
+        
         return dct_mask
 
 
@@ -427,7 +510,7 @@ class SimP:
             for c in range(patch_num):
                 row = r * patch_size
                 col = c * patch_size
-                x_0 = np.array(image[0])  #rgb三通道数据
+                x_0 = np.array(image[0])  #RGB
                 x_1 = np.array(image[1])
                 x_2 = np.array(image[2])
 
@@ -472,12 +555,13 @@ class SimP:
     def fine_grained_binary_search(self, model, x0, y0, patch_num, dct_theta, initial_lbd, initial_lbd_dct,current_best,current_best_dct):
         nquery = 0
         if initial_lbd > current_best:
-            adv,prub = self.generate_adv(x0,patch_num,initial_lbd_dct*dct_theta)
+            adv,prub = self.generate_adv(x0,patch_num,initial_lbd_dct*dct_theta)    
             adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))              
             if adv_class == y0:
-                nquery += 1
+                nquery += 1                                                          
                 return initial_lbd_dct, float('inf'), nquery
-            lbd_dct = current_best_dct
+            lbd_dct = current_best_dct                                        #THE CURRENT BEST IS THE INITIAL LAMBDA VALUE OF A RAW DIRECTION THAT IS LOWER THAN ALL THE INITIAL LAMBDA VALUE OF THE PREVIOUS DIRECTIONS... 
+                                                                              #..THEN ONLY IT PASSES THE DIRECTION FOR BINARY SEARCH
         else:
             lbd_dct = initial_lbd_dct
         lbd = initial_lbd
@@ -491,10 +575,8 @@ class SimP:
             lbd_new = LA.norm(prub)
             adv_class, adv_prob = self.get_results(adv.unsqueeze(0).to(device))            
             if adv_class != y0 :  #and lbd_new < lbd
-                lbd_dct_hi = lbd_dct_mid
+                lbd_dct_hi = lbd_dct_mid                                              
                 lbd = lbd_new
-            else:
-                lbd_dct_lo = lbd_dct_mid
+            else:                                                            #AND FROM THERE THE BINARY SEARCH CONVERGES TO THE LOWEST LAMBDA VALUE OF CURRENT BEST DIRECTION
+                lbd_dct_lo = lbd_dct_mid                                     # (OUTSIDE FUNC) AFTER THIS, THE NEW RAW NORM (lbd) IS COMPARED TO THAT OF GTHETA(LAST BEST PRUB NORM), IF LOWER THAN GTHETA(MEANS UP UNTIL ALL DIRECTIONS THAT PASSED THROUGH BINARY SEARCH, IF THE DISTANCE BETWEEN THIS DIRECTION AND ORIGINAL IMAGE IS LOWER THAN EARLIER CONVERGED BEST), THIS IS THE NEW BEST
         return lbd_dct_hi, lbd, nquery
-    
-

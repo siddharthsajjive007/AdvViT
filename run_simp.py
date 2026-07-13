@@ -45,7 +45,10 @@ if __name__ == "__main__":
         default=None,
         nargs='+',
     ) '''   
-    parser.add_argument('--data_root', type=str, default='D:\\zc\\simple-patch-master2', required=False, help='root directory of imagenet data')
+    # NOTE: default was a dead Windows path ('D:\\zc\\simple-patch-master2').
+    # Left as None on purpose so a missing --data_root fails loudly instead
+    # of silently trying to read a folder that doesn't exist on this machine.
+    parser.add_argument('--data_root', type=str, default=None, required=False, help='root directory of imagenet data (must contain a val/ subfolder in ImageFolder layout)')
     parser.add_argument('--result_dir', type=str, default='save', help='directory for saving results')
     parser.add_argument('--sampled_image_dir', type=str, default='save', help='directory to cache sampled images')
     parser.add_argument('--model', type=str, default='DeiT_T', help='type of base model to use')
@@ -63,6 +66,13 @@ if __name__ == "__main__":
     parser.add_argument('--save_suffix', type=str, default='', help='suffi  BZcvxzVVVVVVVVVV ZXCx appended to save file')
     parser.add_argument('--workers', default=1, type=int)
     args = parser.parse_args()
+
+    if args.data_root is None:
+        raise ValueError(
+            "--data_root was not provided. Pass the path to your ImageNet "
+            "directory that contains a 'val/' subfolder in ImageFolder "
+            "layout, e.g. --data_root /home/siddharthsajjive/ILSVRC2012_val"
+        )
 
     # config = get_config(args)          ####################
 
@@ -89,17 +99,15 @@ if __name__ == "__main__":
         model = deit_base_patch16_224(pretrained=True)
     
     elif args.model == 'Swin_B':
-        pretrained_cfg = timm.models.create_model('swin_base_patch4_window7_224').default_cfg
-        pretrained_cfg['file'] = 'D:\\zc\\simple-patch-master-plus\\swin_base_patch4_window7_224.pth'
-        model = timm.models.create_model('swin_base_patch4_window7_224', pretrained=True, pretrained_cfg=pretrained_cfg)
+        # Fixed: was pointing pretrained_cfg['file'] at a hardcoded Windows
+        # path ('D:\\zc\\simple-patch-master-plus\\swin_base_patch4_window7_224.pth').
+        # Just pull weights straight from timm's hub instead -- simpler and
+        # doesn't require manually sourcing .pth files.
+        model = timm.models.create_model('swin_base_patch4_window7_224', pretrained=True)
     elif args.model == 'Swin_S':
-        pretrained_cfg = timm.models.create_model('swin_small_patch4_window7_224').default_cfg
-        pretrained_cfg['file'] = 'D:\\zc\\simple-patch-master-plus\\swin_small_patch4_window7_224.pth'
-        model = timm.models.create_model('swin_small_patch4_window7_224', pretrained=True, pretrained_cfg=pretrained_cfg)
+        model = timm.models.create_model('swin_small_patch4_window7_224', pretrained=True)
     elif args.model == 'Swin_T':
-        pretrained_cfg = timm.models.create_model('swin_tiny_patch4_window7_224').default_cfg
-        pretrained_cfg['file'] = 'D:\\zc\\simple-patch-master-plus\\swin_tiny_patch4_window7_224.pth'
-        model = timm.models.create_model('swin_tiny_patch4_window7_224', pretrained=True, pretrained_cfg=pretrained_cfg)
+        model = timm.models.create_model('swin_tiny_patch4_window7_224', pretrained=True)
 
     ###############################################################       
     elif args.model == 'ViT_B':
@@ -124,7 +132,7 @@ if __name__ == "__main__":
         testset = dset.ImageFolder(args.data_root + '/val', utils.INCEPTION_TRANSFORM)
     else:
         image_size = 224
-        #testset = dset.ImageFolder(args.data_root + '/val', utils.IMAGENET_TRANSFORM)
+        testset = dset.ImageFolder(args.data_root + '/val', utils.IMAGENET_TRANSFORM)
     attacker = SimP(model, 'imagenet', image_size)
 
     #datasetfile = os.path.join(args.data_root,'dataset')
@@ -135,8 +143,13 @@ if __name__ == "__main__":
 
     #loader = get_loaders(args)
     #############################################################
-    #batchfile = '%s/images_%s_%d.pth' % (args.sampled_image_dir, args.model, args.num_runs)
-    batchfile = 'save\\images_DeiT_T_1000.pth'
+    # Fixed: was a Windows-style literal 'save\\images_DeiT_T_1000.pth'
+    # (note the backslash was actually part of the filename string, not a
+    # path separator, on Linux) and was hardcoded to DeiT_T regardless of
+    # --model, meaning switching models would silently reuse a stale
+    # image cache. Now uses os.path.join and includes the model name.
+    os.makedirs(args.sampled_image_dir, exist_ok=True)
+    batchfile = os.path.join(args.sampled_image_dir, 'images_{}_{}.pth'.format(args.model, args.num_runs))
     if os.path.isfile(batchfile):
         checkpoint = torch.load(batchfile)
         images = checkpoint['images']
