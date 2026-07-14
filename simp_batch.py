@@ -13,7 +13,7 @@ from scipy.fftpack import dct, idct
 from numpy import linalg as LA
 
 
-DATASET = "GTSRB"       # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
+DATASET = "CIFAR"       # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
 
 # mean and std for different datasets
 IMAGENET_SIZE = 224
@@ -69,10 +69,11 @@ DATASET_CONFIGS = {
 }
 
 
-# trf = T.Compose([T.ToPILImage(),
-# 				 T.ToTensor(),
-# 				 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+trf = T.Compose([T.ToPILImage(),
+				 T.ToTensor(),
+				 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 unloader = T.ToPILImage()
+
 device = torch.device('cuda',0)
 
 # Base directory for all saved artifacts (ori/adv/prub images).
@@ -81,6 +82,8 @@ device = torch.device('cuda',0)
 SAVE_BASE = '/home/siddarth/AdvViT/save'
 
 # applies the normalization transformations
+
+
 
 class SimP:
     
@@ -660,3 +663,324 @@ class SimP:
             else:                                                            #AND FROM THERE THE BINARY SEARCH CONVERGES TO THE LOWEST LAMBDA VALUE OF CURRENT BEST DIRECTION
                 lbd_dct_lo = lbd_dct_mid                                     # (OUTSIDE FUNC) AFTER THIS, THE NEW RAW NORM (lbd) IS COMPARED TO THAT OF GTHETA(LAST BEST PRUB NORM), IF LOWER THAN GTHETA(MEANS UP UNTIL ALL DIRECTIONS THAT PASSED THROUGH BINARY SEARCH, IF THE DISTANCE BETWEEN THIS DIRECTION AND ORIGINAL IMAGE IS LOWER THAN EARLIER CONVERGED BEST), THIS IS THE NEW BEST
         return lbd_dct_hi, lbd, nquery
+
+    # ==================================================================
+    # BATCHED ATTACK ENGINE -- processes N images simultaneously.
+    #
+    # Design decisions (see chat for full rationale):
+    #  - DCT/IDCT reimplemented in torch (GPU, matrix-multiplication based)
+    #    instead of cv2/numpy, since cv2 cannot batch across images at all.
+    #  - Per-image adaptive control flow (variable iteration counts,
+    #    early-break line search) is replaced with FIXED-iteration batched
+    #    equivalents: fixed 5-candidate line search (no early break),
+    #    fixed-iteration bisection (no variable-length convergence check).
+    #    Both are mathematically equivalent given enough iterations; they
+    #    just can't skip work early on a per-image basis the way the
+    #    sequential version does.
+    #  - lambda=0 is ALWAYS a valid failing lower bound (unperturbed image
+    #    is never adversarial), so the linear 0.99x bracket-finding search
+    #    used in the original fine_grained_binary_search_local is skipped
+    #    entirely -- bisection just starts at [0, known_success] directly.
+    #  - Finished images (query budget exhausted, or optimizer stuck) are
+    #    masked out via a per-image `active` boolean and simply carried
+    #    forward unchanged for the rest of the batch's iterations.
+    # ==================================================================
+
+    def _get_dct_basis(self, patch_size, device):
+        """Orthonormal DCT-II basis matrix D, shape [patch_size, patch_size],
+        such that 2D DCT of patch P is D @ P @ D.T, and IDCT is D.T @ F @ D
+        (exact inverse since D is orthonormal: D @ D.T = I)."""
+        if not hasattr(self, '_dct_basis_cache'):
+            self._dct_basis_cache = {}
+        key = (patch_size, str(device))
+        if key not in self._dct_basis_cache:
+            n = torch.arange(patch_size, dtype=torch.float64)
+            k = torch.arange(patch_size, dtype=torch.float64).unsqueeze(1)
+            D = torch.cos(np.pi / patch_size * (n + 0.5) * k)
+            D[0, :] *= np.sqrt(1.0 / patch_size)
+            D[1:, :] *= np.sqrt(2.0 / patch_size)
+            self._dct_basis_cache[key] = D.to(dtype=torch.float32, device=device)
+        return self._dct_basis_cache[key]
+
+    def _patches_from_image(self, x, patch_num):
+        """[B,C,H,W] -> [B,C,nH,nW,patch_size,patch_size], nH=nW=patch_num."""
+        B, C, H, W = x.shape
+        patch_size = H // patch_num
+        x = x.view(B, C, patch_num, patch_size, patch_num, patch_size)
+        return x.permute(0, 1, 2, 4, 3, 5), patch_size
+
+    def _image_from_patches(self, patches, patch_num, patch_size):
+        """Inverse of _patches_from_image."""
+        B, C = patches.shape[0], patches.shape[1]
+        H = W = patch_num * patch_size
+        x = patches.permute(0, 1, 2, 4, 3, 5).contiguous()
+        return x.view(B, C, H, W)
+
+    def DCT_trans_batch(self, x0_batch, patch_num):
+        """Batched, GPU-resident replacement for DCT_trans. x0_batch: [B,3,H,W]."""
+        patches, patch_size = self._patches_from_image(x0_batch, patch_num)
+        D = self._get_dct_basis(patch_size, x0_batch.device)
+        dct_patches = torch.matmul(D, patches)
+        dct_patches = torch.matmul(dct_patches, D.transpose(0, 1))
+        return self._image_from_patches(dct_patches, patch_num, patch_size)
+
+    def IDCT_trans_batch(self, x_dct_batch, patch_num):
+        """Batched, GPU-resident replacement for IDCT_trans."""
+        patches, patch_size = self._patches_from_image(x_dct_batch, patch_num)
+        D = self._get_dct_basis(patch_size, x_dct_batch.device)
+        idct_patches = torch.matmul(D.transpose(0, 1), patches)
+        idct_patches = torch.matmul(idct_patches, D)
+        return self._image_from_patches(idct_patches, patch_num, patch_size)
+
+    def generate_adv_batch(self, x0_batch, patch_num, dct_theta_batch):
+        """Batched replacement for generate_adv. All args [B,3,H,W] torch
+        tensors already on the correct device. Returns (adv, prub), both
+        [B,3,H,W]. Assumes image_size is evenly divisible by patch_num
+        (guaranteed for every entry in DATASET_CONFIGS)."""
+        x_dct = self.DCT_trans_batch(x0_batch, patch_num)
+        adv = self.IDCT_trans_batch(x_dct + dct_theta_batch, patch_num)
+        adv = adv.clamp(0, 1)
+        prub = adv - x0_batch
+        return adv, prub
+
+    def get_results_batch(self, x_batch):
+        """Batched replacement for get_results. x_batch: [B,3,H,W]."""
+        x = self.normalize(x_batch.to(device))
+        class_prob = self._forward_logits(x)
+        img_class = class_prob.max(1)[1]                     # [B]
+        top_prob = torch.softmax(class_prob, dim=1).max(1)[0]  # [B]
+        return img_class, top_prob
+
+    def get_label_batch(self, x_batch):
+        """Batched replacement for get_label."""
+        x = self.normalize(x_batch.to(device))
+        class_prob = self._forward_logits(x)
+        return class_prob.max(1)[1]
+
+    def Mask_weight_batch(self, x0_batch, dimen_size, alp, patch_size, use_variance_weight=True):
+        """Batched replacement for Mask_weight -- builds a separate mask M
+        per image in the batch, based on that image's own patch variances.
+        Only runs once per attack call (not per-iteration), so the small
+        remaining python loop over patch positions (not over batch/channel)
+        is negligible cost."""
+        B, C, H, W = x0_batch.shape
+        n = H // patch_size
+        patches, _ = self._patches_from_image(x0_batch, n)
+        # patches: [B,C,n,n,patch_size,patch_size] -- flatten channel+spatial per patch
+        patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n, n, -1)
+        variances = patches.var(dim=-1, unbiased=False)          # [B,n,n]
+        max_var = variances.reshape(B, -1).max(dim=1)[0].view(B, 1, 1)
+        norm_var = variances / (max_var + 1e-12)
+
+        weight = (norm_var * alp) if use_variance_weight else torch.ones_like(norm_var)
+
+        mask = torch.zeros(B, C, H, W, device=x0_batch.device)
+        for r in range(n):
+            for c in range(n):
+                mask[:, :, r*patch_size:r*patch_size+dimen_size, c*patch_size:c*patch_size+dimen_size] = \
+                    weight[:, r, c].view(B, 1, 1, 1)
+        return mask
+
+    def _bisect_batch(self, x0_batch, y0_batch, patch_num, theta_unit, hi, active, n_iters):
+        """Fixed-iteration batched bisection. lo always starts at 0 (always
+        a valid failing bound -- see design note above). Returns
+        (converged_hi [B], best_l2_at_success [B], queries_spent [B]).
+        Rows where `active` is False are left completely untouched."""
+        B = x0_batch.shape[0]
+        dev = x0_batch.device
+        lo = torch.zeros(B, device=dev)
+        hi = hi.clone()
+        best_l2 = torch.full((B,), float('inf'), device=dev)
+        total_q = torch.zeros(B, dtype=torch.long, device=dev)
+        for _ in range(n_iters):
+            mid = (lo + hi) / 2.0
+            adv, prub = self.generate_adv_batch(x0_batch, patch_num, mid.view(B,1,1,1) * theta_unit)
+            adv_class, _ = self.get_results_batch(adv)
+            succ = (adv_class != y0_batch) & active
+            total_q += active.long()
+            l2 = prub.flatten(1).norm(dim=1)
+            best_l2 = torch.where(succ, torch.minimum(best_l2, l2), best_l2)
+            hi = torch.where(succ, mid, hi)
+            lo = torch.where(succ, lo, mid)
+        return hi, best_l2, total_q
+
+    def sign_grad_batch(self, x0_batch, y0_batch, patch_num, theta_dct, initial_lbd_dct, dct_mask, h, active):
+        """Batched replacement for sign_grad_v1. h: scalar or [B] tensor.
+        The K=self.k loop stays sequential (each step needs the previous
+        result of nothing -- probes are independent -- but sign_grad itself
+        is accumulated sequentially for simplicity); the real speedup is
+        that EACH step now processes the whole batch in one GPU forward
+        pass instead of B separate sequential single-image calls."""
+        B = x0_batch.shape[0]
+        K = self.k
+        sign_grad = torch.zeros_like(theta_dct)
+        h_ = h.view(B,1,1,1) if torch.is_tensor(h) else h
+        for _ in range(K):
+            u = torch.randn_like(theta_dct) * dct_mask
+            u = u / u.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
+            new_theta = theta_dct + h_ * u
+            new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
+            adv, _ = self.generate_adv_batch(x0_batch, patch_num, initial_lbd_dct.view(B,1,1,1) * new_theta)
+            adv_class, _ = self.get_results_batch(adv)
+            sign = torch.where(adv_class != y0_batch, torch.tensor(-1.0, device=x0_batch.device),
+                                                        torch.tensor(1.0, device=x0_batch.device))
+            sign_grad += u * sign.view(B,1,1,1)
+        sign_grad /= K
+        return sign_grad
+
+    def attack_untargeted_batch(self, x0_batch, y0_batch, patch_num, alpha=0.2, beta=0.001,
+                                 iterations=1000, query_limit=4000, use_sign_opt_plus=False,
+                                 num_directions=100, bisect_iters=20, bisect_iters_local=15,
+                                 dimen_size=None, alp=4, verbose_every=10):
+        """
+        Batched version of attack_untargeted -- runs N images simultaneously.
+        x0_batch: [B,3,H,W], y0_batch: [B] (long tensor of clean-predicted labels).
+        Returns: adv [B,3,H,W], distortion [B], success [B] bool, queries [B] long, prub [B,3,H,W].
+        """
+        B = x0_batch.shape[0]
+        dev = x0_batch.device
+        x0_batch = x0_batch.to(dev)
+        y0_batch = y0_batch.to(dev)
+
+        if dimen_size is None:
+            dimen_size = DATASET_CONFIGS[self.dataset]['dimen_size']
+        patch_size = int(self.image_size / patch_num)
+
+        dct_mask = self.Mask_weight_batch(x0_batch, dimen_size, alp, patch_size)  # [B,3,H,W]
+
+        # ---- Phase 1: initial direction search (batched) ----
+        print(f"[batch] Searching for initial direction on {num_directions} random directions, batch size {B}...")
+        query_count = torch.zeros(B, dtype=torch.long, device=dev)
+        g_theta = torch.full((B,), float('inf'), device=dev)
+        g_dct = torch.full((B,), float('inf'), device=dev)
+        best_theta_dct = torch.zeros_like(x0_batch)
+
+        for _ in range(num_directions):
+            query_count += 1
+            theta = torch.randn_like(x0_batch) * dct_mask
+            adv, prub = self.generate_adv_batch(x0_batch, patch_num, theta)
+            adv_class, _ = self.get_results_batch(adv)
+            succeeded = (adv_class != y0_batch)
+            if not succeeded.any():
+                continue
+
+            theta_norm = theta.flatten(1).norm(dim=1).clamp_min(1e-12)
+            theta_unit = theta / theta_norm.view(B,1,1,1)
+
+            hi, best_l2, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, theta_unit,
+                                                     hi=theta_norm, active=succeeded, n_iters=bisect_iters)
+            query_count += bs_q
+            improved = succeeded & (best_l2 < g_theta)
+            g_theta = torch.where(improved, best_l2, g_theta)
+            g_dct = torch.where(improved, hi, g_dct)
+            best_theta_dct = torch.where(improved.view(B,1,1,1), theta_unit, best_theta_dct)
+
+        found_initial = (g_theta < float('inf'))
+        print(f"[batch] Initial direction found for {found_initial.sum().item()}/{B} images "
+              f"(mean queries so far: {query_count.float().mean().item():.0f})")
+        # Images with no initial direction found are marked inactive from the start --
+        # they'll be reported as failures. (No fallback flat-mask retry in the batched
+        # path, unlike the sequential version -- can be added later if this matters
+        # for your data; flagging as a known scope gap.)
+
+        # ---- Phase 2: gradient descent (batched, per-image active masking) ----
+        xg = best_theta_dct.clone()
+        gg = g_theta.clone()
+        gg_dct = g_dct.clone()
+        alpha_t = torch.full((B,), float(alpha), device=dev)
+        beta_t = torch.full((B,), float(beta), device=dev)
+        active = found_initial.clone()
+
+        for i in range(iterations):
+            if not active.any():
+                break
+
+            sign_gradient = self.sign_grad_batch(x0_batch, y0_batch, patch_num, xg, gg_dct, dct_mask,
+                                                   h=beta_t, active=active)
+            query_count += torch.where(active, torch.full((B,), self.k, dtype=torch.long, device=dev),
+                                                  torch.zeros(B, dtype=torch.long, device=dev))
+
+            best_cand_theta = xg.clone()
+            best_cand_g2 = gg.clone()
+            best_cand_lbd = gg_dct.clone()
+            improved_this_iter = torch.zeros(B, dtype=torch.bool, device=dev)
+
+            # ---- fixed 5-candidate increasing-alpha sweep ----
+            cur_alpha = alpha_t.clone()
+            for _ in range(5):
+                new_theta = xg - cur_alpha.view(B,1,1,1) * sign_gradient
+                new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
+
+                if use_sign_opt_plus:
+                    check_lbd = torch.where(improved_this_iter, best_cand_lbd, gg_dct)
+                    adv_check, _ = self.generate_adv_batch(x0_batch, patch_num, check_lbd.view(B,1,1,1) * new_theta)
+                    check_class, _ = self.get_results_batch(adv_check)
+                    gate_pass = (check_class != y0_batch) & active
+                    query_count += active.long()
+                else:
+                    gate_pass = active.clone()
+
+                if gate_pass.any():
+                    new_lbd, _, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, new_theta,
+                                                            hi=gg_dct, active=gate_pass, n_iters=bisect_iters_local)
+                    query_count += bs_q
+                    adv, prub = self.generate_adv_batch(x0_batch, patch_num, new_lbd.view(B,1,1,1) * new_theta)
+                    new_g2 = prub.flatten(1).norm(dim=1)
+                    better = gate_pass & (new_g2 < best_cand_g2)
+                    best_cand_theta = torch.where(better.view(B,1,1,1), new_theta, best_cand_theta)
+                    best_cand_g2 = torch.where(better, new_g2, best_cand_g2)
+                    best_cand_lbd = torch.where(better, new_lbd, best_cand_lbd)
+                    improved_this_iter = improved_this_iter | better
+
+                cur_alpha = torch.where(gate_pass, torch.clamp(cur_alpha * 2, max=1e6), cur_alpha)
+
+            # ---- fixed 5-candidate decreasing-alpha fallback, only for images that didn't improve ----
+            need_fallback = active & (~improved_this_iter)
+            cur_alpha_dec = alpha_t.clone()
+            for _ in range(5):
+                cur_alpha_dec = cur_alpha_dec * 0.25
+                new_theta = xg - cur_alpha_dec.view(B,1,1,1) * sign_gradient
+                new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
+
+                if use_sign_opt_plus:
+                    adv_check, _ = self.generate_adv_batch(x0_batch, patch_num, gg_dct.view(B,1,1,1) * new_theta)
+                    check_class, _ = self.get_results_batch(adv_check)
+                    gate_pass = (check_class != y0_batch) & need_fallback
+                    query_count += need_fallback.long()
+                else:
+                    gate_pass = need_fallback.clone()
+
+                if gate_pass.any():
+                    new_lbd, _, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, new_theta,
+                                                            hi=gg_dct, active=gate_pass, n_iters=bisect_iters_local)
+                    query_count += bs_q
+                    adv, prub = self.generate_adv_batch(x0_batch, patch_num, new_lbd.view(B,1,1,1) * new_theta)
+                    new_g2 = prub.flatten(1).norm(dim=1)
+                    better = gate_pass & (new_g2 < gg)
+                    best_cand_theta = torch.where(better.view(B,1,1,1), new_theta, best_cand_theta)
+                    best_cand_g2 = torch.where(better, new_g2, best_cand_g2)
+                    best_cand_lbd = torch.where(better, new_lbd, best_cand_lbd)
+                    improved_this_iter = improved_this_iter | better
+                    need_fallback = need_fallback & (~better)
+
+            # ---- per-image stuck detection (mirrors the sequential alpha<1e-4 reset) ----
+            stuck = active & (~improved_this_iter)
+            alpha_t = torch.where(stuck, torch.full((B,), 1.0, device=dev), torch.clamp(alpha_t * 2, max=1e6))
+            beta_t = torch.where(stuck, beta_t * 0.1, beta_t)
+            active = active & (beta_t >= 1e-8)
+
+            xg = best_cand_theta
+            gg = best_cand_g2
+            gg_dct = best_cand_lbd
+
+            active = active & (query_count <= query_limit)
+
+            if (i + 1) % verbose_every == 0:
+                finite_gg = gg[torch.isfinite(gg)]
+                mean_gg = finite_gg.mean().item() if finite_gg.numel() > 0 else float('nan')
+                print(f"[batch] iter {i+1:4d}  active={int(active.sum().item())}/{B}  "
+                      f"mean_distortion={mean_gg:.4f}  mean_queries={query_count.float().mean().item():.0f}")
+
+        adv_final, prub_final = self.generate_adv_batch(x0_batch, patch_num, gg_dct.view(B,1,1,1) * xg)
+        success = found_initial.clone()  # a batch entry is "successful" iff Phase 1 found any working direction
+        return adv_final, gg, success, query_count, prub_final

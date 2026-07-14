@@ -1,11 +1,13 @@
 import os
 import torch
+import zipfile
+import random
 from PIL import Image
 import torchvision.transforms as T
 import numpy as np
 import matplotlib.pyplot as plt
 
-from simp import SimP, DATASET
+from simp import SimP, DATASET, DATASET_CONFIGS
 from skimage.metrics import structural_similarity as ssim_fn
 from skimage.metrics import peak_signal_noise_ratio as psnr_fn
 
@@ -14,11 +16,22 @@ print('CUDA available:', torch.cuda.is_available())
 print('Device:', device)
 
 '''
-MENTION THE DATASET IN simp.py  FILE AND THE MODEL IN THIS FILE BELOW
+MENTION THE DATASET IN simp.py AND THE MODEL USED IN THIS FILE BELOW
 '''
-MODEL_ARCH = 'DeiT_T'   # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
-IMAGE_PATH = "/home/siddarth/AdvViT/ILSVRC2012_val_pairs/2b.JPEG"
-#IMAGE_PATH = '/home/siddharthsajjive/AdvViT/save/ori/ori0.jpg' # <-- change this
+MODEL_ARCH = 'resnet18_cifar10'   # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
+
+# ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
+ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
+# ZIP_PATH = "/home/HDD/ATAF/Datasets/GTSRB//GTSRB_test_ataf.zip"
+
+
+# Pull resolution/patch geometry from simp.py's DATASET_CONFIGS instead of
+# hardcoding -- this is the single source of truth shared with SimP itself,
+# so IMAGE_SIZE/PATCH_SIZE here always match whatever SimP actually uses
+# internally, regardless of which DATASET is configured in simp.py.
+config = DATASET_CONFIGS[DATASET]
+IMAGE_SIZE = config['size']
+PATCH_SIZE = config['patch_size']
 
 
 def load_model(model_arch='ViT', device=None):
@@ -77,18 +90,42 @@ def load_model(model_arch='ViT', device=None):
     return net
 
 
+def load_random_image_from_zip(zip_path, image_size, device):
+    """
+    Loads a random image from the zip's images/ folder,
+    matching the format of the original single-image loader.
+    Returns x0: [3, IMAGE_SIZE, IMAGE_SIZE] tensor, range [0,1]
+    """
+    with zipfile.ZipFile(zip_path, 'r') as z:
+        # list all image files inside the zip's images/ folder
+        image_files = [
+            f for f in z.namelist()
+            if f.startswith('images/') and f.lower().endswith(('.jpeg', '.jpg', '.png'))
+        ]
+        
+        # pick one at random
+        chosen_file = random.choice(image_files)
+        
+        with z.open(chosen_file) as f:
+            img = Image.open(f).convert('RGB').resize((image_size, image_size))
+    
+    x0 = T.ToTensor()(img).to(device)   # [3, IMAGE_SIZE, IMAGE_SIZE], range [0,1]
+    return x0, chosen_file
+
+
+
 # ── load model once ──
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Loading {MODEL_ARCH} on {device}...")
 model = load_model(MODEL_ARCH, device)
 
 
-img = Image.open(IMAGE_PATH).convert('RGB').resize((224, 224))
-x0 = T.ToTensor()(img).to(device)  # [3,224,224], range [0,1]
+x0, chosen_filename = load_random_image_from_zip(ZIP_PATH, IMAGE_SIZE, device)
+print(f"Loaded random image: {chosen_filename}")
 
 
 #Get prediction
-attacker = SimP(model, DATASET , image_size=224)
+attacker = SimP(model, DATASET, image_size=IMAGE_SIZE)
 with torch.no_grad():
     y0 = attacker.get_label(x0.unsqueeze(0))
 print(f'Clean prediction (class index): {y0.item()}')
@@ -98,8 +135,8 @@ print(f'Clean prediction (class index): {y0.item()}')
 import time
 
 print(MODEL_ARCH)
-patch_size = 16
-patch_num = 224 // patch_size
+patch_size = PATCH_SIZE
+patch_num = IMAGE_SIZE // PATCH_SIZE
 QUERY_LIMIT = 3000
 
 t0 = time.time()
@@ -161,7 +198,7 @@ fig.suptitle(f'L2={distortion:.3f}  SSIM={ssim_val:.4f}  PSNR={psnr_val:.2f}dB  
 plt.tight_layout()
 
 # Save the full 3-panel figure -- Linux-side path, matches what
-SAVE_NAME = f'animal_{QUERY_LIMIT}_{MODEL_ARCH}'
+SAVE_NAME = f'animal_{QUERY_LIMIT}_{MODEL_ARCH}_{DATASET}'
 print("Image saved to AdvViT/save") 
 save_dir = '/home/siddarth/AdvViT/OUTPUT'
 os.makedirs(save_dir, exist_ok=True)
