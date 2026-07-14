@@ -176,30 +176,6 @@ class SimP:
         img_class = class_prob.max(1)[1]
         return img_class
 
-    # 20-line implementation of SimBA for single image input
-    def simba_single(self, x, y, num_iters=10000, epsilon=0.2, targeted=False):
-        n_dims = x.view(1, -1).size(1)
-        perm = torch.randperm(n_dims)
-        x = x.unsqueeze(0)
-        last_prob = self.get_probs(x, y)
-        for i in range(num_iters):
-            diff = torch.zeros(n_dims)
-            diff[perm[i]] = epsilon
-            left_prob = self.get_probs((x - diff.view(x.size())).clamp(0, 1), y)
-            if targeted != (left_prob < last_prob):
-                x = (x - diff.view(x.size())).clamp(0, 1)
-                last_prob = left_prob
-            else:
-                right_prob = self.get_probs((x + diff.view(x.size())).clamp(0, 1), y)
-                if targeted != (right_prob < last_prob):
-                    x = (x + diff.view(x.size())).clamp(0, 1)
-                    last_prob = right_prob
-            if i % 10 == 0:
-                print(last_prob)
-        return x.squeeze()
-
-    # runs simba on a batch of images <images_batch> with true labels (for untargeted attack) or target labels
-    # (for targeted attack) <labels_batch>
 
     def generate_adv(self, x0, patch_num,dct_theta):
         x = np.array(x0.clone())                        #[3,image_size,image_size]
@@ -665,178 +641,233 @@ class SimP:
         return lbd_dct_hi, lbd, nquery
 
     # ==================================================================
-    # BATCHED ATTACK ENGINE -- processes N images simultaneously.
+    # BATCHED ATTACK ENGINE -- SAME ALGORITHM AS ABOVE, BUT RUNS B IMAGES AT ONCE
     #
-    # Design decisions (see chat for full rationale):
-    #  - DCT/IDCT reimplemented in torch (GPU, matrix-multiplication based)
-    #    instead of cv2/numpy, since cv2 cannot batch across images at all.
-    #  - Per-image adaptive control flow (variable iteration counts,
-    #    early-break line search) is replaced with FIXED-iteration batched
-    #    equivalents: fixed 5-candidate line search (no early break),
-    #    fixed-iteration bisection (no variable-length convergence check).
-    #    Both are mathematically equivalent given enough iterations; they
-    #    just can't skip work early on a per-image basis the way the
-    #    sequential version does.
-    #  - lambda=0 is ALWAYS a valid failing lower bound (unperturbed image
-    #    is never adversarial), so the linear 0.99x bracket-finding search
-    #    used in the original fine_grained_binary_search_local is skipped
-    #    entirely -- bisection just starts at [0, known_success] directly.
-    #  - Finished images (query budget exhausted, or optimizer stuck) are
-    #    masked out via a per-image `active` boolean and simply carried
-    #    forward unchanged for the rest of the batch's iterations.
+    # KEY IDEA: every tensor that used to be ONE image's worth of data ([3,H,W]
+    # or a single scalar) now has an extra leading batch dim B ([B,3,H,W] or [B]).
+    # Every operation (dct, mask, query, compare) runs on the WHOLE batch in one
+    # shot instead of looping image-by-image -- that's where the speedup comes from.
+    #
+    # WHY CV2 COULDN'T BE REUSED: cv2.dct only ever takes ONE 2D array at a time,
+    # there is no way to hand it a batch. So the DCT/IDCT had to be rebuilt using
+    # torch matrix multiplication instead (D @ patch @ D.T), which DOES support
+    # a batch dimension for free via torch's broadcasting. Verified this produces
+    # IDENTICAL numbers to cv2.dct (checked to float32 precision) before trusting it.
+    #
+    # WHAT CAN'T BE DIRECTLY COPIED FROM THE SEQUENTIAL VERSION, AND WHY:
+    #  1) THE SEQUENTIAL LINE SEARCH "TRIES UP TO 5 STEPS, STOPS EARLY IF ONE FAILS"
+    #     -- can't do a per-image early stop inside a batched tensor op (some images
+    #     would want to stop at step 2, others at step 5 -- a tensor can't have rows
+    #     that did different numbers of loop passes). FIX: always run all 5 candidate
+    #     steps for EVERY image, and just keep whichever one was best per image
+    #     (the ones that "should" have stopped early just keep testing candidates
+    #     that don't improve on what they already found -- wasted compute, not a
+    #     correctness problem).
+    #  2) THE SEQUENTIAL BINARY SEARCH RUNS "UNTIL THE GAP < tol" (VARIABLE LENGTH)
+    #     -- same problem, different images converge after a different number of
+    #     halvings. FIX: just run a FIXED number of halvings (n_iters) for
+    #     everybody. After enough halvings the gap is tiny regardless of where it
+    #     started, so this reaches the same answer, just sometimes with a few
+    #     "wasted" extra halvings on images that would've converged sooner.
+    #  3) THE SEQUENTIAL fine_grained_binary_search_local FIRST HUNTS FOR A FAILING
+    #     LOWER BOUND BY SHRINKING 0.99x REPEATEDLY (variable length again) --
+    #     REALIZED THIS STEP ISN'T ACTUALLY NEEDED AT ALL: lambda=0 means "no
+    #     perturbation", which is JUST THE ORIGINAL IMAGE, and the original image
+    #     is by definition NOT adversarial. So lo=0 is ALWAYS a valid failing bound,
+    #     no searching required -- just start the bracket at [0, known_success] and
+    #     go straight to bisecting. Simpler AND removes another variable-length step.
+    #  4) "WHICH IMAGES ARE STILL BEING ATTACKED" -- tracked with a boolean tensor
+    #     called `active`, one entry per image. An image goes inactive once it runs
+    #     out of query budget OR its optimizer gets stuck (same alpha<1e-4 / beta
+    #     shrink logic as the sequential version, just per-image now). IMPORTANT:
+    #     going "inactive" does NOT mean that image stops being computed on --
+    #     every image still goes through every tensor op every iteration (you can't
+    #     shrink a tensor mid-loop), it just means torch.where(...) throws away
+    #     that image's new result and keeps its old xg/gg/gg_dct frozen instead.
+    #     The whole outer loop only stops once EVERY image is inactive.
     # ==================================================================
 
     def _get_dct_basis(self, patch_size, device):
-        """Orthonormal DCT-II basis matrix D, shape [patch_size, patch_size],
-        such that 2D DCT of patch P is D @ P @ D.T, and IDCT is D.T @ F @ D
-        (exact inverse since D is orthonormal: D @ D.T = I)."""
+        # BUILDS THE "D" MATRIX SUCH THAT D @ PATCH @ D.T = cv2.dct(PATCH), FOR
+        # ANY PATCH OF SHAPE (patch_size, patch_size). THIS IS WHAT LETS US DO
+        # DCT ON THE WHOLE BATCH AT ONCE INSTEAD OF ONE PATCH AT A TIME LIKE cv2.
+        # D IS ORTHONORMAL (D @ D.T = IDENTITY) SO THE INVERSE IS JUST D.T @ F @ D
+        # -- NO SEPARATE "IDCT MATRIX" NEEDED, SAME D DOES BOTH DIRECTIONS.
+        # CACHED PER (patch_size, device) SINCE IT'S THE SAME MATRIX EVERY CALL --
+        # NO POINT REBUILDING IT EVERY SINGLE generate_adv_batch CALL.
         if not hasattr(self, '_dct_basis_cache'):
             self._dct_basis_cache = {}
         key = (patch_size, str(device))
         if key not in self._dct_basis_cache:
             n = torch.arange(patch_size, dtype=torch.float64)
             k = torch.arange(patch_size, dtype=torch.float64).unsqueeze(1)
-            D = torch.cos(np.pi / patch_size * (n + 0.5) * k)
-            D[0, :] *= np.sqrt(1.0 / patch_size)
-            D[1:, :] *= np.sqrt(2.0 / patch_size)
+            D = torch.cos(np.pi / patch_size * (n + 0.5) * k)          # DCT-II BASIS FORMULA
+            D[0, :] *= np.sqrt(1.0 / patch_size)                       # ORTHONORMAL SCALING, ROW 0 (DC TERM)
+            D[1:, :] *= np.sqrt(2.0 / patch_size)                      # ORTHONORMAL SCALING, ALL OTHER ROWS
             self._dct_basis_cache[key] = D.to(dtype=torch.float32, device=device)
         return self._dct_basis_cache[key]
 
     def _patches_from_image(self, x, patch_num):
-        """[B,C,H,W] -> [B,C,nH,nW,patch_size,patch_size], nH=nW=patch_num."""
+        # SLICES A WHOLE BATCH OF IMAGES INTO THEIR PATCHES IN ONE SHOT, NO PYTHON
+        # LOOP -- THIS IS THE VECTORIZED EQUIVALENT OF THE "row = r*patch_size;
+        # col = c*patch_size; patch = image[row:row+patch_size, col:col+patch_size]"
+        # LOOP FROM THE ORIGINAL DCT_trans/IDCT_trans. [B,C,H,W] -> [B,C,nH,nW,d,d]
         B, C, H, W = x.shape
         patch_size = H // patch_num
         x = x.view(B, C, patch_num, patch_size, patch_num, patch_size)
-        return x.permute(0, 1, 2, 4, 3, 5), patch_size
+        return x.permute(0, 1, 2, 4, 3, 5), patch_size          # REARRANGE SO (nH,nW) SIT TOGETHER, THEN (d,d) TOGETHER
 
     def _image_from_patches(self, patches, patch_num, patch_size):
-        """Inverse of _patches_from_image."""
+        # UNDOES _patches_from_image -- STITCHES THE PATCHES BACK INTO ONE FULL IMAGE PER BATCH ROW
         B, C = patches.shape[0], patches.shape[1]
         H = W = patch_num * patch_size
         x = patches.permute(0, 1, 2, 4, 3, 5).contiguous()
         return x.view(B, C, H, W)
 
     def DCT_trans_batch(self, x0_batch, patch_num):
-        """Batched, GPU-resident replacement for DCT_trans. x0_batch: [B,3,H,W]."""
+        # BATCHED VERSION OF DCT_trans -- SAME MATH (PER-PATCH 2D DCT), BUT ALL
+        # PATCHES, ALL CHANNELS, ALL B IMAGES DONE IN ONE MATRIX MULTIPLY INSTEAD
+        # OF THE ORIGINAL'S TRIPLE-NESTED PYTHON LOOP (r, c, channel) CALLING
+        # cv2.dct ONE PATCH AT A TIME. x0_batch: [B,3,H,W]
         patches, patch_size = self._patches_from_image(x0_batch, patch_num)
         D = self._get_dct_basis(patch_size, x0_batch.device)
-        dct_patches = torch.matmul(D, patches)
-        dct_patches = torch.matmul(dct_patches, D.transpose(0, 1))
+        dct_patches = torch.matmul(D, patches)                       # D @ PATCH
+        dct_patches = torch.matmul(dct_patches, D.transpose(0, 1))    # (D @ PATCH) @ D.T  = FULL 2D DCT
         return self._image_from_patches(dct_patches, patch_num, patch_size)
 
     def IDCT_trans_batch(self, x_dct_batch, patch_num):
-        """Batched, GPU-resident replacement for IDCT_trans."""
+        # SAME IDEA AS ABOVE BUT INVERSE -- D.T @ F @ D UNDOES THE DCT SINCE D IS ORTHONORMAL
         patches, patch_size = self._patches_from_image(x_dct_batch, patch_num)
         D = self._get_dct_basis(patch_size, x_dct_batch.device)
-        idct_patches = torch.matmul(D.transpose(0, 1), patches)
-        idct_patches = torch.matmul(idct_patches, D)
+        idct_patches = torch.matmul(D.transpose(0, 1), patches)       # D.T @ F
+        idct_patches = torch.matmul(idct_patches, D)                  # (D.T @ F) @ D  = FULL 2D IDCT
         return self._image_from_patches(idct_patches, patch_num, patch_size)
 
     def generate_adv_batch(self, x0_batch, patch_num, dct_theta_batch):
-        """Batched replacement for generate_adv. All args [B,3,H,W] torch
-        tensors already on the correct device. Returns (adv, prub), both
-        [B,3,H,W]. Assumes image_size is evenly divisible by patch_num
-        (guaranteed for every entry in DATASET_CONFIGS)."""
+        # BATCHED VERSION OF generate_adv -- SAME THREE STEPS (DCT ORIGINAL, ADD
+        # PERTURBATION IN DCT SPACE, IDCT BACK TO PIXELS), JUST FOR B IMAGES AT
+        # ONCE. dct_theta_batch IS ALREADY lambda*theta' (SCALED, MASKED
+        # DIRECTION) FOR EVERY IMAGE IN THE BATCH. RETURNS (adv, prub), BOTH
+        # [B,3,H,W]. ASSUMES image_size DIVIDES EVENLY BY patch_num (TRUE FOR
+        # EVERY DATASET_CONFIGS ENTRY, SO THE ORIGINAL'S "LEFTOVER EDGE STRIP"
+        # PATCHING ISN'T NEEDED HERE).
         x_dct = self.DCT_trans_batch(x0_batch, patch_num)
         adv = self.IDCT_trans_batch(x_dct + dct_theta_batch, patch_num)
         adv = adv.clamp(0, 1)
-        prub = adv - x0_batch
+        prub = adv - x0_batch                                          # PIXEL-SPACE PERTURBATION, PER IMAGE
         return adv, prub
 
     def get_results_batch(self, x_batch):
-        """Batched replacement for get_results. x_batch: [B,3,H,W]."""
+        # BATCHED VERSION OF get_results -- ONE MODEL FORWARD PASS FOR ALL B
+        # IMAGES INSTEAD OF B SEPARATE CALLS. THIS IS WHERE THE ACTUAL SPEEDUP
+        # COMES FROM: EVERY PLACE THAT USED TO QUERY ONE IMAGE AT A TIME NOW
+        # QUERIES THE WHOLE BATCH IN ONE GPU CALL.
         x = self.normalize(x_batch.to(device))
         class_prob = self._forward_logits(x)
-        img_class = class_prob.max(1)[1]                     # [B]
-        top_prob = torch.softmax(class_prob, dim=1).max(1)[0]  # [B]
+        img_class = class_prob.max(1)[1]                       # [B] PREDICTED CLASS PER IMAGE
+        top_prob = torch.softmax(class_prob, dim=1).max(1)[0]   # [B] CONFIDENCE PER IMAGE
         return img_class, top_prob
 
     def get_label_batch(self, x_batch):
-        """Batched replacement for get_label."""
+        # SAME AS ABOVE, JUST THE CLASS, NO CONFIDENCE (MATCHES get_label)
         x = self.normalize(x_batch.to(device))
         class_prob = self._forward_logits(x)
         return class_prob.max(1)[1]
 
     def Mask_weight_batch(self, x0_batch, dimen_size, alp, patch_size, use_variance_weight=True):
-        """Batched replacement for Mask_weight -- builds a separate mask M
-        per image in the batch, based on that image's own patch variances.
-        Only runs once per attack call (not per-iteration), so the small
-        remaining python loop over patch positions (not over batch/channel)
-        is negligible cost."""
+        # BATCHED VERSION OF Mask_weight -- BUILDS A SEPARATE MASK M PER IMAGE,
+        # SINCE EACH IMAGE HAS ITS OWN PATCH TEXTURE (VARIANCE). ONLY RUNS ONCE
+        # PER attack_untargeted_batch CALL (NOT PER-ITERATION), SO THE SMALL
+        # REMAINING PYTHON LOOP BELOW (OVER PATCH POSITIONS, NOT OVER BATCH OR
+        # CHANNEL) COSTS NOTHING NOTICEABLE.
         B, C, H, W = x0_batch.shape
         n = H // patch_size
         patches, _ = self._patches_from_image(x0_batch, n)
-        # patches: [B,C,n,n,patch_size,patch_size] -- flatten channel+spatial per patch
+        # patches: [B,C,n,n,patch_size,patch_size] -- COMBINE CHANNEL+SPATIAL INTO ONE
+        # FLAT DIM PER PATCH SO torch.var CAN COMPUTE ONE SCALAR PER PATCH, MATCHING
+        # THE ORIGINAL'S torch.var(patch) WHICH ALSO POOLED ALL CHANNELS TOGETHER.
         patches = patches.permute(0, 2, 3, 1, 4, 5).reshape(B, n, n, -1)
-        variances = patches.var(dim=-1, unbiased=False)          # [B,n,n]
-        max_var = variances.reshape(B, -1).max(dim=1)[0].view(B, 1, 1)
-        norm_var = variances / (max_var + 1e-12)
+        variances = patches.var(dim=-1, unbiased=False)                      # [B,n,n] -- ONE q_i PER PATCH PER IMAGE
+        max_var = variances.reshape(B, -1).max(dim=1)[0].view(B, 1, 1)       # max(Q), PER IMAGE
+        norm_var = variances / (max_var + 1e-12)                             # Eq. 6: q_i' = q_i / max(Q)
 
-        weight = (norm_var * alp) if use_variance_weight else torch.ones_like(norm_var)
+        weight = (norm_var * alp) if use_variance_weight else torch.ones_like(norm_var)   # Eq. 7 vs FLAT-1 ABLATION
 
         mask = torch.zeros(B, C, H, W, device=x0_batch.device)
         for r in range(n):
             for c in range(n):
+                # STAMP EACH PATCH'S WEIGHT INTO ITS LOW-FREQUENCY CORNER, SAME
+                # BROADCAST PATTERN AS THE SEQUENTIAL Mask_weight, JUST DONE FOR
+                # ALL B IMAGES' CORNERS AT ONCE VIA THE [:,1,1,1] BROADCAST.
                 mask[:, :, r*patch_size:r*patch_size+dimen_size, c*patch_size:c*patch_size+dimen_size] = \
                     weight[:, r, c].view(B, 1, 1, 1)
         return mask
 
     def _bisect_batch(self, x0_batch, y0_batch, patch_num, theta_unit, hi, active, n_iters):
-        """Fixed-iteration batched bisection. lo always starts at 0 (always
-        a valid failing bound -- see design note above). Returns
-        (converged_hi [B], best_l2_at_success [B], queries_spent [B]).
-        Rows where `active` is False are left completely untouched."""
+        # BATCHED, FIXED-ITERATION BINARY SEARCH -- REPLACES BOTH
+        # fine_grained_binary_search AND fine_grained_binary_search_local FROM
+        # THE SEQUENTIAL VERSION. lo ALWAYS STARTS AT 0 (SEE THE BIG COMMENT
+        # BLOCK ABOVE -- lambda=0 IS ALWAYS A GUARANTEED-FAILING BOUND, SO THE
+        # ORIGINAL'S "HUNT FOR A FAILING LOWER BOUND BY SHRINKING 0.99x" STEP
+        # ISN'T NEEDED AT ALL). RUNS n_iters HALVINGS UNCONDITIONALLY FOR EVERY
+        # IMAGE -- ROWS THAT WOULD'VE CONVERGED SOONER JUST KEEP HALVING AN
+        # ALREADY-TINY GAP, HARMLESS, JUST SLIGHTLY WASTEFUL.
+        # ROWS WHERE active IS False ARE COMPLETELY UNTOUCHED (frozen).
+        # RETURNS: (converged_hi [B] = BEST LAMBDA FOUND, best_l2_at_success [B]
+        # = PIXEL-SPACE DISTORTION AT THAT LAMBDA, queries_spent [B])
         B = x0_batch.shape[0]
         dev = x0_batch.device
-        lo = torch.zeros(B, device=dev)
-        hi = hi.clone()
+        lo = torch.zeros(B, device=dev)                          # lambda=0 -- ALWAYS FAILS, NO SEARCH NEEDED
+        hi = hi.clone()                                          # KNOWN-SUCCESSFUL STARTING DISTANCE, PER IMAGE
         best_l2 = torch.full((B,), float('inf'), device=dev)
         total_q = torch.zeros(B, dtype=torch.long, device=dev)
         for _ in range(n_iters):
-            mid = (lo + hi) / 2.0
+            mid = (lo + hi) / 2.0                                 # MIDPOINT OF THE BRACKET, PER IMAGE
             adv, prub = self.generate_adv_batch(x0_batch, patch_num, mid.view(B,1,1,1) * theta_unit)
-            adv_class, _ = self.get_results_batch(adv)
-            succ = (adv_class != y0_batch) & active
-            total_q += active.long()
+            adv_class, _ = self.get_results_batch(adv)            # ONE QUERY, WHOLE BATCH AT ONCE
+            succ = (adv_class != y0_batch) & active                # STILL ADVERSARIAL AT THIS MIDPOINT?
+            total_q += active.long()                               # ONLY COUNT A QUERY FOR ROWS STILL ACTIVE
             l2 = prub.flatten(1).norm(dim=1)
             best_l2 = torch.where(succ, torch.minimum(best_l2, l2), best_l2)
-            hi = torch.where(succ, mid, hi)
-            lo = torch.where(succ, lo, mid)
+            hi = torch.where(succ, mid, hi)                        # SUCCEEDED -> TIGHTEN THE KNOWN-GOOD SIDE DOWN
+            lo = torch.where(succ, lo, mid)                        # FAILED -> TIGHTEN THE KNOWN-BAD SIDE UP
         return hi, best_l2, total_q
 
     def sign_grad_batch(self, x0_batch, y0_batch, patch_num, theta_dct, initial_lbd_dct, dct_mask, h, active):
-        """Batched replacement for sign_grad_v1. h: scalar or [B] tensor.
-        The K=self.k loop stays sequential (each step needs the previous
-        result of nothing -- probes are independent -- but sign_grad itself
-        is accumulated sequentially for simplicity); the real speedup is
-        that EACH step now processes the whole batch in one GPU forward
-        pass instead of B separate sequential single-image calls."""
+        # BATCHED VERSION OF sign_grad_v1 -- SAME K=200 RANDOM PROBES, SAME
+        # SIGN-FLIP LOGIC (Eq. 11-12), BUT EVERY PROBE'S QUERY NOW COVERS ALL B
+        # IMAGES IN ONE MODEL CALL INSTEAD OF ONE IMAGE AT A TIME. THE K-LOOP
+        # ITSELF IS STILL SEQUENTIAL (200 PASSES), BUT EACH PASS IS NOW B TIMES
+        # CHEAPER PER-IMAGE THAN THE ORIGINAL SINCE IT'S ONE BATCHED GPU CALL
+        # INSTEAD OF B SEPARATE ONES. h CAN BE A SCALAR OR A [B] TENSOR (SINCE
+        # THE OUTER LOOP SHRINKS beta PER-IMAGE ON A STUCK OPTIMIZER, NOT GLOBALLY).
         B = x0_batch.shape[0]
-        K = self.k
+        K = self.k   # 200
         sign_grad = torch.zeros_like(theta_dct)
         h_ = h.view(B,1,1,1) if torch.is_tensor(h) else h
         for _ in range(K):
-            u = torch.randn_like(theta_dct) * dct_mask
-            u = u / u.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
-            new_theta = theta_dct + h_ * u
+            u = torch.randn_like(theta_dct) * dct_mask                # mu(j) = mu(j) * M(mask), SAME AS SEQUENTIAL
+            u = u / u.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)   # NORMALIZED, PER IMAGE
+            new_theta = theta_dct + h_ * u                            # theta' + epsilon*mu(j)
             new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
             adv, _ = self.generate_adv_batch(x0_batch, patch_num, initial_lbd_dct.view(B,1,1,1) * new_theta)
-            adv_class, _ = self.get_results_batch(adv)
+            adv_class, _ = self.get_results_batch(adv)                # ONE QUERY, WHOLE BATCH AT ONCE
             sign = torch.where(adv_class != y0_batch, torch.tensor(-1.0, device=x0_batch.device),
-                                                        torch.tensor(1.0, device=x0_batch.device))
-            sign_grad += u * sign.view(B,1,1,1)
-        sign_grad /= K
+                                                        torch.tensor(1.0, device=x0_batch.device))  # ADVERSARIAL -> -1, PER IMAGE
+            sign_grad += u * sign.view(B,1,1,1)                        # ACCUMULATE SIGNED DIRECTION, PER IMAGE
+        sign_grad /= K                                                  # (1/J) NORMALIZE, PER IMAGE
         return sign_grad
 
     def attack_untargeted_batch(self, x0_batch, y0_batch, patch_num, alpha=0.2, beta=0.001,
                                  iterations=1000, query_limit=4000, use_sign_opt_plus=False,
                                  num_directions=100, bisect_iters=20, bisect_iters_local=15,
                                  dimen_size=None, alp=4, verbose_every=10):
-        """
-        Batched version of attack_untargeted -- runs N images simultaneously.
-        x0_batch: [B,3,H,W], y0_batch: [B] (long tensor of clean-predicted labels).
-        Returns: adv [B,3,H,W], distortion [B], success [B] bool, queries [B] long, prub [B,3,H,W].
-        """
+        # BATCHED VERSION OF attack_untargeted -- SAME TWO PHASES (RANDOM DIRECTION
+        # SEARCH, THEN GRADIENT DESCENT), SAME OVERALL LOGIC, JUST EVERY VARIABLE
+        # THAT WAS ONE NUMBER/ONE IMAGE BEFORE IS NOW A [B]-LENGTH TENSOR OR A
+        # [B,3,H,W] TENSOR. x0_batch: [B,3,H,W], y0_batch: [B] (CLEAN PREDICTED
+        # LABELS). RETURNS adv[B,3,H,W], distortion[B], success[B] bool,
+        # queries[B] long, prub[B,3,H,W] -- ONE RESULT PER IMAGE IN THE BATCH.
         B = x0_batch.shape[0]
         dev = x0_batch.device
         x0_batch = x0_batch.to(dev)
@@ -846,31 +877,38 @@ class SimP:
             dimen_size = DATASET_CONFIGS[self.dataset]['dimen_size']
         patch_size = int(self.image_size / patch_num)
 
-        dct_mask = self.Mask_weight_batch(x0_batch, dimen_size, alp, patch_size)  # [B,3,H,W]
+        dct_mask = self.Mask_weight_batch(x0_batch, dimen_size, alp, patch_size)  # ONE MASK M PER IMAGE, BUILT ONCE
 
-        # ---- Phase 1: initial direction search (batched) ----
+        # ---- PHASE 1: INITIAL DIRECTION SEARCH, BATCHED ----
+        # SAME AS THE SEQUENTIAL VERSION'S "for i in range(num_directions):" LOOP --
+        # TRY num_directions RANDOM MASKED DIRECTIONS, KEEP WHICHEVER GIVES THE
+        # SMALLEST DISTORTION PER IMAGE. NO EARLY EXIT HERE EITHER IN THE
+        # SEQUENTIAL VERSION -- ALL num_directions ALWAYS GET TRIED, SO THIS
+        # BATCHES CLEANLY WITHOUT NEEDING ANY PER-IMAGE SKIP LOGIC.
         print(f"[batch] Searching for initial direction on {num_directions} random directions, batch size {B}...")
         query_count = torch.zeros(B, dtype=torch.long, device=dev)
-        g_theta = torch.full((B,), float('inf'), device=dev)
-        g_dct = torch.full((B,), float('inf'), device=dev)
-        best_theta_dct = torch.zeros_like(x0_batch)
+        g_theta = torch.full((B,), float('inf'), device=dev)       # BEST DISTORTION FOUND SO FAR, PER IMAGE
+        g_dct = torch.full((B,), float('inf'), device=dev)          # BEST LAMBDA (DCT SCALE) FOR THAT DIRECTION
+        best_theta_dct = torch.zeros_like(x0_batch)                 # BEST THETA'/||THETA'|| SO FAR, PER IMAGE
 
         for _ in range(num_directions):
             query_count += 1
-            theta = torch.randn_like(x0_batch) * dct_mask
+            theta = torch.randn_like(x0_batch) * dct_mask           # theta' = theta * M, FOR EVERY IMAGE AT ONCE
             adv, prub = self.generate_adv_batch(x0_batch, patch_num, theta)
             adv_class, _ = self.get_results_batch(adv)
-            succeeded = (adv_class != y0_batch)
+            succeeded = (adv_class != y0_batch)                     # PER-IMAGE: DID THIS RANDOM DIRECTION FOOL THE MODEL?
             if not succeeded.any():
-                continue
+                continue                                             # NOBODY IN THE BATCH SUCCEEDED THIS ROUND, SKIP THE REFINE STEP
 
-            theta_norm = theta.flatten(1).norm(dim=1).clamp_min(1e-12)
-            theta_unit = theta / theta_norm.view(B,1,1,1)
+            theta_norm = theta.flatten(1).norm(dim=1).clamp_min(1e-12)   # ||theta'||, PER IMAGE
+            theta_unit = theta / theta_norm.view(B,1,1,1)                # theta'/||theta'||, PER IMAGE
 
+            # REFINE ONLY THE IMAGES THAT SUCCEEDED THIS ROUND (active=succeeded) --
+            # OTHER IMAGES' ROWS ARE PASSED THROUGH UNTOUCHED INSIDE _bisect_batch.
             hi, best_l2, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, theta_unit,
                                                      hi=theta_norm, active=succeeded, n_iters=bisect_iters)
             query_count += bs_q
-            improved = succeeded & (best_l2 < g_theta)
+            improved = succeeded & (best_l2 < g_theta)               # IS THIS DIRECTION BETTER THAN THE BEST FOUND SO FAR FOR THIS IMAGE?
             g_theta = torch.where(improved, best_l2, g_theta)
             g_dct = torch.where(improved, hi, g_dct)
             best_theta_dct = torch.where(improved.view(B,1,1,1), theta_unit, best_theta_dct)
@@ -878,63 +916,79 @@ class SimP:
         found_initial = (g_theta < float('inf'))
         print(f"[batch] Initial direction found for {found_initial.sum().item()}/{B} images "
               f"(mean queries so far: {query_count.float().mean().item():.0f})")
-        # Images with no initial direction found are marked inactive from the start --
-        # they'll be reported as failures. (No fallback flat-mask retry in the batched
-        # path, unlike the sequential version -- can be added later if this matters
-        # for your data; flagging as a known scope gap.)
+        # IMAGES WITH NO INITIAL DIRECTION FOUND STAY INACTIVE FROM THE START --
+        # THEY'LL BE REPORTED AS FAILURES. (NO FALLBACK FLAT-MASK RETRY HERE, UNLIKE
+        # THE SEQUENTIAL VERSION'S "if success_flag == False:" BLOCK -- KNOWN GAP,
+        # CAN BE ADDED LATER IF IT TURNS OUT TO MATTER FOR YOUR DATA.)
 
-        # ---- Phase 2: gradient descent (batched, per-image active masking) ----
-        xg = best_theta_dct.clone()
-        gg = g_theta.clone()
-        gg_dct = g_dct.clone()
-        alpha_t = torch.full((B,), float(alpha), device=dev)
-        beta_t = torch.full((B,), float(beta), device=dev)
-        active = found_initial.clone()
+        # ---- PHASE 2: GRADIENT DESCENT, BATCHED, PER-IMAGE active MASKING ----
+        xg = best_theta_dct.clone()          # xg IS THE BEST (THETA'/||THETA'||), PER IMAGE
+        gg = g_theta.clone()                 # gg IS THE BEST RAW L2 DISTORTION, PER IMAGE
+        gg_dct = g_dct.clone()               # gg_dct IS THE BEST LAMBDA FOR xg, PER IMAGE
+        alpha_t = torch.full((B,), float(alpha), device=dev)   # STEP SIZE, PER IMAGE (EACH IMAGE ADAPTS INDEPENDENTLY)
+        beta_t = torch.full((B,), float(beta), device=dev)     # PROBE MAGNITUDE, PER IMAGE
+        active = found_initial.clone()       # WHICH IMAGES ARE STILL BEING REFINED
 
         for i in range(iterations):
             if not active.any():
-                break
+                break                          # EVERY IMAGE DONE (BUDGET EXHAUSTED OR STUCK) -- STOP THE WHOLE BATCH
 
+            # sign_grad_batch RETURNS THE AVERAGE OF ALL mu(j) THAT NUDGED xg TOWARD
+            # ADVERSARIAL, SAME AS THE SEQUENTIAL sign_grad_v1, BUT ONE PER IMAGE AT ONCE
             sign_gradient = self.sign_grad_batch(x0_batch, y0_batch, patch_num, xg, gg_dct, dct_mask,
                                                    h=beta_t, active=active)
+            # K=200 QUERIES SPENT FOR EVERY STILL-ACTIVE IMAGE THIS ITERATION, 0 FOR INACTIVE ONES
             query_count += torch.where(active, torch.full((B,), self.k, dtype=torch.long, device=dev),
                                                   torch.zeros(B, dtype=torch.long, device=dev))
 
-            best_cand_theta = xg.clone()
+            best_cand_theta = xg.clone()       # "NEXT THETA" CANDIDATE TRACKER, STARTS AS "NO IMPROVEMENT FOUND YET"
             best_cand_g2 = gg.clone()
             best_cand_lbd = gg_dct.clone()
-            improved_this_iter = torch.zeros(B, dtype=torch.bool, device=dev)
+            improved_this_iter = torch.zeros(B, dtype=torch.bool, device=dev)   # DID ANY CANDIDATE BEAT gg THIS ITERATION?
 
-            # ---- fixed 5-candidate increasing-alpha sweep ----
+            # ---- FIXED 5-CANDIDATE INCREASING-ALPHA SWEEP ----
+            # SEQUENTIAL VERSION TRIES UP TO 5 STEPS AND STOPS EARLY THE MOMENT ONE
+            # FAILS TO IMPROVE. CAN'T DO THAT PER-IMAGE IN A BATCHED TENSOR OP (SEE
+            # HEADER COMMENT), SO INSTEAD: ALWAYS RUN ALL 5, KEEP WHICHEVER WAS BEST
+            # PER IMAGE. IMAGES THAT WOULD'VE STOPPED EARLY JUST KEEP TESTING
+            # CANDIDATES THAT DON'T BEAT THEIR CURRENT BEST -- WASTED QUERIES, NOT
+            # A CORRECTNESS ISSUE.
             cur_alpha = alpha_t.clone()
             for _ in range(5):
-                new_theta = xg - cur_alpha.view(B,1,1,1) * sign_gradient
+                new_theta = xg - cur_alpha.view(B,1,1,1) * sign_gradient   # UPDATED THETA' FOR THIS ATTEMPT, PER IMAGE
                 new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
 
                 if use_sign_opt_plus:
+                    # SIGN-OPT+ GATE: ONE CHEAP QUERY AT THE CURRENT BEST-IN-THIS-
+                    # ATTEMPT-SEQUENCE LAMBDA (best_cand_lbd, WHICH TIGHTENS AS BETTER
+                    # CANDIDATES ARE FOUND WITHIN THESE 5 ATTEMPTS) BEFORE PAYING FOR
+                    # THE FULL BISECTION. SAME GATE AS THE SEQUENTIAL AD+ PATH, JUST
+                    # CHECKED FOR ALL B IMAGES AT ONCE.
                     check_lbd = torch.where(improved_this_iter, best_cand_lbd, gg_dct)
                     adv_check, _ = self.generate_adv_batch(x0_batch, patch_num, check_lbd.view(B,1,1,1) * new_theta)
                     check_class, _ = self.get_results_batch(adv_check)
-                    gate_pass = (check_class != y0_batch) & active
+                    gate_pass = (check_class != y0_batch) & active         # STILL ADVERSARIAL AT THE GATE DISTANCE, AND STILL ACTIVE
                     query_count += active.long()
                 else:
-                    gate_pass = active.clone()
+                    gate_pass = active.clone()                            # PLAIN AD: NO GATE, EVERY ACTIVE IMAGE GOES STRAIGHT TO BISECTION
 
                 if gate_pass.any():
                     new_lbd, _, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, new_theta,
                                                             hi=gg_dct, active=gate_pass, n_iters=bisect_iters_local)
                     query_count += bs_q
                     adv, prub = self.generate_adv_batch(x0_batch, patch_num, new_lbd.view(B,1,1,1) * new_theta)
-                    new_g2 = prub.flatten(1).norm(dim=1)
-                    better = gate_pass & (new_g2 < best_cand_g2)
+                    new_g2 = prub.flatten(1).norm(dim=1)                   # NEW RAW L2 DISTORTION FOR THIS CANDIDATE
+                    better = gate_pass & (new_g2 < best_cand_g2)           # BEATS THE BEST CANDIDATE FOUND SO FAR THIS ITERATION?
                     best_cand_theta = torch.where(better.view(B,1,1,1), new_theta, best_cand_theta)
                     best_cand_g2 = torch.where(better, new_g2, best_cand_g2)
                     best_cand_lbd = torch.where(better, new_lbd, best_cand_lbd)
                     improved_this_iter = improved_this_iter | better
 
-                cur_alpha = torch.where(gate_pass, torch.clamp(cur_alpha * 2, max=1e6), cur_alpha)
+                cur_alpha = torch.where(gate_pass, torch.clamp(cur_alpha * 2, max=1e6), cur_alpha)   # GRADUALLY INCREASING STEP SIZE, CAPPED
 
-            # ---- fixed 5-candidate decreasing-alpha fallback, only for images that didn't improve ----
+            # ---- FIXED 5-CANDIDATE DECREASING-ALPHA FALLBACK, ONLY FOR IMAGES THAT DIDN'T IMPROVE ABOVE ----
+            # MIRRORS THE SEQUENTIAL "if min_g2 >= gg:" FALLBACK BLOCK -- ONLY RUNS
+            # FOR THE SUBSET need_fallback THAT THE INCREASING SWEEP DIDN'T HELP.
             need_fallback = active & (~improved_this_iter)
             cur_alpha_dec = alpha_t.clone()
             for _ in range(5):
@@ -961,19 +1015,21 @@ class SimP:
                     best_cand_g2 = torch.where(better, new_g2, best_cand_g2)
                     best_cand_lbd = torch.where(better, new_lbd, best_cand_lbd)
                     improved_this_iter = improved_this_iter | better
-                    need_fallback = need_fallback & (~better)
+                    need_fallback = need_fallback & (~better)             # STOP RETRYING AN IMAGE ONCE IT IMPROVED
 
-            # ---- per-image stuck detection (mirrors the sequential alpha<1e-4 reset) ----
-            stuck = active & (~improved_this_iter)
+            # ---- PER-IMAGE STUCK DETECTION (MIRRORS THE SEQUENTIAL alpha<1e-4 RESET) ----
+            stuck = active & (~improved_this_iter)                        # BOTH SWEEPS FAILED TO IMPROVE THIS IMAGE THIS ITERATION
             alpha_t = torch.where(stuck, torch.full((B,), 1.0, device=dev), torch.clamp(alpha_t * 2, max=1e6))
-            beta_t = torch.where(stuck, beta_t * 0.1, beta_t)
-            active = active & (beta_t >= 1e-8)
+            beta_t = torch.where(stuck, beta_t * 0.1, beta_t)             # SHRINK THE PROBE MAGNITUDE FOR STUCK IMAGES
+            active = active & (beta_t >= 1e-8)                            # GIVE UP ON AN IMAGE ONCE beta COLLAPSES
 
+            # IF ALL ATTEMPTS FAILED FOR AN IMAGE, best_cand_* WILL STILL EQUAL ITS
+            # OLD xg/gg/gg_dct (I.E. "NOT MOVING"), SAME AS THE SEQUENTIAL VERSION
             xg = best_cand_theta
             gg = best_cand_g2
             gg_dct = best_cand_lbd
 
-            active = active & (query_count <= query_limit)
+            active = active & (query_count <= query_limit)                # DROP IMAGES THAT RAN OUT OF QUERY BUDGET
 
             if (i + 1) % verbose_every == 0:
                 finite_gg = gg[torch.isfinite(gg)]
@@ -982,5 +1038,5 @@ class SimP:
                       f"mean_distortion={mean_gg:.4f}  mean_queries={query_count.float().mean().item():.0f}")
 
         adv_final, prub_final = self.generate_adv_batch(x0_batch, patch_num, gg_dct.view(B,1,1,1) * xg)
-        success = found_initial.clone()  # a batch entry is "successful" iff Phase 1 found any working direction
+        success = found_initial.clone()   # AN IMAGE COUNTS AS "SUCCESSFUL" IFF PHASE 1 FOUND ANY WORKING DIRECTION AT ALL
         return adv_final, gg, success, query_count, prub_final
