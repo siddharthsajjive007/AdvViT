@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-import utils
 from skimage import io, color,data,exposure,img_as_float
 import numpy as np
 import cv2
@@ -14,6 +13,44 @@ from scipy.fftpack import dct, idct
 from numpy import linalg as LA
 
 
+DATASET = "IMAGENET_3599"       # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
+
+# mean and std for different datasets
+IMAGENET_SIZE = 224
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+IMAGENET_TRANSFORM = T.Compose([
+    T.Resize(256),
+    T.CenterCrop(224),
+    T.ToTensor()])
+
+INCEPTION_SIZE = 299
+INCEPTION_TRANSFORM = T.Compose([
+    T.Resize(342),
+    T.CenterCrop(299),
+    T.ToTensor()])
+
+CIFAR_SIZE = 32
+CIFAR_MEAN = [0.4914, 0.4822, 0.4465]
+CIFAR_STD = [0.2023, 0.1994, 0.2010]
+CIFAR_TRANSFORM = T.Compose([
+    T.ToTensor()])
+
+MNIST_SIZE = 28
+MNIST_MEAN = [0.5]
+MNIST_STD = [1.0]
+MNIST_TRANSFORM = T.Compose([
+    T.ToTensor()])
+
+GTSRB_SIZE = 32
+GTSRB_MEAN = [0.3403, 0.3121, 0.3214]
+GTSRB_STD  = [0.2724, 0.2608, 0.2669]
+GTSRB_TRANSFORM = T.Compose([
+    T.Resize((32, 32)),
+    T.ToTensor(),
+])
+
+
 trf = T.Compose([T.ToPILImage(),
 				 T.ToTensor(),
 				 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
@@ -24,7 +61,10 @@ device = torch.device('cuda',0)
 # Base directory for all saved artifacts (ori/adv/prub images).
 # Fixed from the original hardcoded 'D:\\zc\\simple-patch-master-plus\\save\\...'
 # which only existed on the authors' Windows machine.
-SAVE_BASE = '/home/siddharthsajjive/AdvViT/save'
+SAVE_BASE = '/home/siddarth/AdvViT/save'
+
+# applies the normalization transformations
+
 
 
 class SimP:
@@ -43,18 +83,34 @@ class SimP:
         z[:, :, :size, :size] = x
         return z
         
+    def apply_normalization(self, imgs, dataset):
+        if dataset in ('IMAGENET', 'IMAGENET_3599'):
+            mean = IMAGENET_MEAN
+            std = IMAGENET_STD
+        elif dataset == 'CIFAR':
+            mean = CIFAR_MEAN
+            std = CIFAR_STD
+        elif dataset == 'MNIST':
+            mean = MNIST_MEAN
+            std = MNIST_STD
+        elif dataset == 'GTSRB':
+            mean = GTSRB_MEAN
+            std = GTSRB_STD
+        imgs_tensor = imgs.clone()
+        if dataset == 'mnist':
+            imgs_tensor = (imgs_tensor - mean[0]) / std[0]
+        else:
+            if imgs.dim() == 3:
+                for i in range(imgs_tensor.size(0)):
+                    imgs_tensor[i, :, :] = (imgs_tensor[i, :, :] - mean[i]) / std[i]
+            else:
+                for i in range(imgs_tensor.size(1)):
+                    imgs_tensor[:, i, :, :] = (imgs_tensor[:, i, :, :] - mean[i]) / std[i]
+        return imgs_tensor
+        
     def normalize(self, x):
-        return utils.apply_normalization(x, self.dataset)
+        return self.apply_normalization(x, self.dataset)
 
-    '''def get_probs(self, x, y):
-        output = self.model(self.normalize(x.to(device))).cpu()
-        probs = torch.index_select(F.softmax(output, dim=-1).data, 1, y)
-        return torch.diag(probs)
-    
-    def get_preds(self, x):
-        output = self.model(self.normalize(x.to(device))).cpu()
-        _, preds = output.data.max(1)
-        return preds'''
 
     def _forward_logits(self, x):
         """
@@ -189,9 +245,7 @@ class SimP:
                                 the AdvViT+ / "AD+" variant.
 
         """
-        #success_thold = 5.0
-        #best_zero_num = 0
-
+    
         model = self.model
         query_count = 0
         ls_total = 0

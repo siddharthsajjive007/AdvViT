@@ -5,7 +5,7 @@ import torchvision.transforms as T
 import numpy as np
 import matplotlib.pyplot as plt
 
-from simp import SimP
+from simp import SimP, DATASET
 from skimage.metrics import structural_similarity as ssim_fn
 from skimage.metrics import peak_signal_noise_ratio as psnr_fn
 
@@ -13,82 +13,91 @@ device = torch.device('cuda', 0)
 print('CUDA available:', torch.cuda.is_available())
 print('Device:', device)
 
-# ---- uncomment ONE of these ----
-# MODEL_CHOICE = 'DeiT_T'
-# MODEL_CHOICE = 'DeiT_S'
-MODEL_CHOICE = 'DeiT_B'
-# MODEL_CHOICE = 'ResNet18'
-# MODEL_CHOICE = 'ResNet50'
-# MODEL_CHOICE = 'ResNet101'
-# MODEL_CHOICE = 'ResNet152'
-# MODEL_CHOICE = 'VGG16'
-# MODEL_CHOICE = 'Swin_T'
-# MODEL_CHOICE = 'Swin_S'
-# MODEL_CHOICE = 'Swin_B'
-# MODEL_CHOICE = 'ViT_B'   # patch_size=32, not 16 -- see note above
-
-if MODEL_CHOICE == 'DeiT_T':
-    from models.DeiT import deit_tiny_patch16_224
-    model = deit_tiny_patch16_224(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'DeiT_S':
-    from models.DeiT import deit_small_patch16_224
-    model = deit_small_patch16_224(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'DeiT_B':
-    from models.DeiT import deit_base_patch16_224
-    model = deit_base_patch16_224(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'ResNet18':
-    import torchvision
-    model = torchvision.models.resnet18(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'ResNet50':
-    from models.resnet import ResNet50
-    model = ResNet50(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'ResNet101':
-    from models.resnet import ResNet101
-    model = ResNet101(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'ResNet152':
-    from models.resnet import ResNet152
-    model = ResNet152(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'VGG16':
-    import torchvision
-    model = torchvision.models.vgg16(pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'Swin_T':
-    import timm
-    model = timm.models.create_model('swin_tiny_patch4_window7_224', pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'Swin_S':
-    import timm
-    model = timm.models.create_model('swin_small_patch4_window7_224', pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'Swin_B':
-    import timm
-    model = timm.models.create_model('swin_base_patch4_window7_224', pretrained=True).to(device).eval()
-elif MODEL_CHOICE == 'ViT_B':
-    import timm
-    model = timm.create_model('vit_base_patch32_224.augreg_in1k', pretrained=True).to(device).eval()
-else:
-    raise ValueError(f'Unknown MODEL_CHOICE: {MODEL_CHOICE}')
-
-print(f'Loaded {MODEL_CHOICE}')
-
-
-IMAGE_PATH = '/home/siddharthsajjive/TEA/ATTACK/ILSVRC2012_val_pairs/2b.JPEG' 
+'''
+MENTION THE DATASET IN simp.py  FILE AND THE MODEL IN THIS FILE BELOW
+'''
+MODEL_ARCH = 'DeiT_T'   # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
+IMAGE_PATH = "/home/siddarth/AdvViT/ILSVRC2012_val_pairs/2b.JPEG"
 #IMAGE_PATH = '/home/siddharthsajjive/AdvViT/save/ori/ori0.jpg' # <-- change this
+
+
+def load_model(model_arch='ViT', device=None):
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    if model_arch == 'resnet50':
+        net = torch.load(
+            "/home/siddarth/ATTACK/resnet50_testing_model.pth",
+            map_location=device,
+            weights_only=False
+        )
+    elif model_arch == 'resnet18_cifar10':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/Patchfool/pytorch_models/cifar10/resnet18_cifar10.pth',
+            map_location=device
+        )
+    elif model_arch == 'resnet50_cifar10':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/Patchfool/pytorch_models/cifar10/resnet50_cifar10.pth',
+            map_location=device
+        )
+    elif model_arch == 'deit_cifar10':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/Patchfool/pytorch_models/cifar10/deit_cifar10_epoch_0070_ataf_ready.pth',
+            map_location=device)
+    elif model_arch == 'resnet50_gtsrb32':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/GTSRB/gtsrb_resnet50_32.pth',
+            map_location=device)
+    elif model_arch == 'DeiT_T':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/Patchfool/pytorch_models/deit_variations/deit_tiny_patch16_224_ataf_ready.pth',
+            map_location=device
+    )
+    elif model_arch == 'DeiT_S':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/Patchfool/pytorch_models/deit_variations/deit_small_patch16_224_ataf_ready.pth',
+            map_location=device
+        )
+    elif model_arch == 'DeiT_B':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/Patchfool/pytorch_models/deit_variations/deit_base_patch16_224_ataf_ready.pth',
+            map_location=device
+        )
+    elif model_arch == 'ViT':
+        net = torch.load(
+            '/home/HDD/ATAF/Model-files/ViT/vit_base_patch16_224_pytorch_complete.zip',
+            map_location=device
+        )
+    else:
+        raise ValueError(f"Unsupported model architecture: {model_arch}")
+
+    net = net.to(device)
+    net.eval()
+    return net
+
+
+# ── load model once ──
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Loading {MODEL_ARCH} on {device}...")
+model = load_model(MODEL_ARCH, device)
+
 
 img = Image.open(IMAGE_PATH).convert('RGB').resize((224, 224))
 x0 = T.ToTensor()(img).to(device)  # [3,224,224], range [0,1]
 
 
-
 #Get prediction
-attacker = SimP(model, 'imagenet', image_size=224)
+attacker = SimP(model, DATASET , image_size=224)
 with torch.no_grad():
     y0 = attacker.get_label(x0.unsqueeze(0))
 print(f'Clean prediction (class index): {y0.item()}')
 
 
-
-#AD+ ATTACK========================================
+#================AD+ ATTACK==============================
 import time
 
-print(MODEL_CHOICE)
+print(MODEL_ARCH)
 patch_size = 16
 patch_num = 224 // patch_size
 QUERY_LIMIT = 3000
@@ -101,19 +110,6 @@ adv, distortion, is_success, nqueries, prub = attacker.attack_untargeted(
 elapsed = time.time() - t0
 
 print(f'Attack finished in {elapsed:.1f}s ({elapsed/60:.2f} min).')
-
-# print('\nRunning AD+ (Sign-OPT+ gated)...')
-# t0 = time.time()
-# adv_adp, distortion_adp, success_adp, queries_adp, prub_adp = attacker.attack_untargeted(
-#     x0, y0, ori_probal=None, patch_num=patch_num,
-#     query_limit=QUERY_LIMIT, use_sign_opt_plus=True
-# )
-# time_adp = time.time() - t0
-# print(f'AD+ finished in {time_adp:.1f}s ({time_adp/60:.2f} min)')
-
-# print(f'\nBoth runs finished. AD+ was {time_ad/time_adp:.2f}x the speed of AD (>1 means AD+ faster).')
-
-
 
 
 # Results — attack outcome, L2 distortion, SSIM, PSNR
@@ -142,8 +138,6 @@ print('=' * 50)
 #============================== VISUALIZATION =============================================
 
 
-SAVE_NAME = f'insect_{MODEL_CHOICE}'
-print("Image saved to AdvViT/save")  # <-- change this per run, e.g. 'dog_photo', 'run2', etc.
 
 # amplify the perturbation for visibility -- raw diff is usually near-invisible
 diff = adv_np - ori_np
@@ -167,10 +161,9 @@ fig.suptitle(f'L2={distortion:.3f}  SSIM={ssim_val:.4f}  PSNR={psnr_val:.2f}dB  
 plt.tight_layout()
 
 # Save the full 3-panel figure -- Linux-side path, matches what
-# \\wsl.localhost\Ubuntu\home\siddharthsajjive\AdvViT\save maps to
-SAVE_NAME = f'animal_{QUERY_LIMIT}_{MODEL_CHOICE}'
+SAVE_NAME = f'animal_{QUERY_LIMIT}_{MODEL_ARCH}'
 print("Image saved to AdvViT/save") 
-save_dir = '/home/siddharthsajjive/AdvViT/save'
+save_dir = '/home/siddarth/AdvViT/OUTPUT'
 os.makedirs(save_dir, exist_ok=True)
 fig.savefig(os.path.join(save_dir, f'output_ad+_{SAVE_NAME}.png'), dpi=150, bbox_inches='tight')
 plt.show()

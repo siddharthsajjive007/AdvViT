@@ -6,6 +6,9 @@ from scipy.fftpack import dct, idct
 from os import path
 from torchvision import datasets, transforms
 
+
+DATASET = "IMAGENET_3599"       # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
+
 # mean and std for different datasets
 IMAGENET_SIZE = 224
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -33,6 +36,15 @@ MNIST_STD = [1.0]
 MNIST_TRANSFORM = trans.Compose([
     trans.ToTensor()])
 
+GTSRB_SIZE = 32
+GTSRB_MEAN = [0.3403, 0.3121, 0.3214]
+GTSRB_STD  = [0.2724, 0.2608, 0.2669]
+GTSRB_TRANSFORM = trans.Compose([
+    trans.Resize((32, 32)),
+    trans.ToTensor(),
+])
+
+
 def clamp(X, lower_limit, upper_limit):
     return torch.max(torch.min(X, upper_limit), lower_limit)
 
@@ -52,7 +64,7 @@ def get_loaders(args):
     return val_loader
 # reverses the normalization transformation
 def invert_normalization(imgs, dataset):
-    if dataset == 'imagenet':
+    if dataset in ('IMAGENET_3599', 'IMAGENET'):
         mean = IMAGENET_MEAN
         std = IMAGENET_STD
     elif dataset == 'cifar':
