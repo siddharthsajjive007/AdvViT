@@ -13,7 +13,7 @@ from scipy.fftpack import dct, idct
 from numpy import linalg as LA
 
 
-DATASET = "CIFAR"       # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
+DATASET = "IMAGENET_3599"      # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
 
 # mean and std for different datasets
 IMAGENET_SIZE = 224
@@ -742,7 +742,7 @@ class SimP:
         idct_patches = torch.matmul(D.transpose(0, 1), patches)       # D.T @ F
         idct_patches = torch.matmul(idct_patches, D)                  # (D.T @ F) @ D  = FULL 2D IDCT
         return self._image_from_patches(idct_patches, patch_num, patch_size)
-
+    @torch.no_grad()
     def generate_adv_batch(self, x0_batch, patch_num, dct_theta_batch):
         # BATCHED VERSION OF generate_adv -- SAME THREE STEPS (DCT ORIGINAL, ADD
         # PERTURBATION IN DCT SPACE, IDCT BACK TO PIXELS), JUST FOR B IMAGES AT
@@ -756,7 +756,7 @@ class SimP:
         adv = adv.clamp(0, 1)
         prub = adv - x0_batch                                          # PIXEL-SPACE PERTURBATION, PER IMAGE
         return adv, prub
-
+    @torch.no_grad()
     def get_results_batch(self, x_batch):
         # BATCHED VERSION OF get_results -- ONE MODEL FORWARD PASS FOR ALL B
         # IMAGES INSTEAD OF B SEPARATE CALLS. THIS IS WHERE THE ACTUAL SPEEDUP
@@ -767,13 +767,13 @@ class SimP:
         img_class = class_prob.max(1)[1]                       # [B] PREDICTED CLASS PER IMAGE
         top_prob = torch.softmax(class_prob, dim=1).max(1)[0]   # [B] CONFIDENCE PER IMAGE
         return img_class, top_prob
-
+    @torch.no_grad()
     def get_label_batch(self, x_batch):
         # SAME AS ABOVE, JUST THE CLASS, NO CONFIDENCE (MATCHES get_label)
         x = self.normalize(x_batch.to(device))
         class_prob = self._forward_logits(x)
         return class_prob.max(1)[1]
-
+    @torch.no_grad()
     def Mask_weight_batch(self, x0_batch, dimen_size, alp, patch_size, use_variance_weight=True):
         # BATCHED VERSION OF Mask_weight -- BUILDS A SEPARATE MASK M PER IMAGE,
         # SINCE EACH IMAGE HAS ITS OWN PATCH TEXTURE (VARIANCE). ONLY RUNS ONCE
@@ -802,7 +802,7 @@ class SimP:
                 mask[:, :, r*patch_size:r*patch_size+dimen_size, c*patch_size:c*patch_size+dimen_size] = \
                     weight[:, r, c].view(B, 1, 1, 1)
         return mask
-
+    @torch.no_grad()
     def _bisect_batch(self, x0_batch, y0_batch, patch_num, theta_unit, hi, active, n_iters):
         # BATCHED, FIXED-ITERATION BINARY SEARCH -- REPLACES BOTH
         # fine_grained_binary_search AND fine_grained_binary_search_local FROM
@@ -832,7 +832,7 @@ class SimP:
             hi = torch.where(succ, mid, hi)                        # SUCCEEDED -> TIGHTEN THE KNOWN-GOOD SIDE DOWN
             lo = torch.where(succ, lo, mid)                        # FAILED -> TIGHTEN THE KNOWN-BAD SIDE UP
         return hi, best_l2, total_q
-
+    @torch.no_grad()
     def sign_grad_batch(self, x0_batch, y0_batch, patch_num, theta_dct, initial_lbd_dct, dct_mask, h, active):
         # BATCHED VERSION OF sign_grad_v1 -- SAME K=200 RANDOM PROBES, SAME
         # SIGN-FLIP LOGIC (Eq. 11-12), BUT EVERY PROBE'S QUERY NOW COVERS ALL B
@@ -857,7 +857,8 @@ class SimP:
             sign_grad += u * sign.view(B,1,1,1)                        # ACCUMULATE SIGNED DIRECTION, PER IMAGE
         sign_grad /= K                                                  # (1/J) NORMALIZE, PER IMAGE
         return sign_grad
-
+    
+    @torch.no_grad()
     def attack_untargeted_batch(self, x0_batch, y0_batch, patch_num, alpha=0.2, beta=0.001,
                                  iterations=1000, query_limit=4000, use_sign_opt_plus=False,
                                  num_directions=100, bisect_iters=20, bisect_iters_local=15,
@@ -869,7 +870,7 @@ class SimP:
         # LABELS). RETURNS adv[B,3,H,W], distortion[B], success[B] bool,
         # queries[B] long, prub[B,3,H,W] -- ONE RESULT PER IMAGE IN THE BATCH.
         B = x0_batch.shape[0]
-        dev = x0_batch.device
+        dev = device   # use the module-level GPU device, not whatever device x0_batch happened to arrive on
         x0_batch = x0_batch.to(dev)
         y0_batch = y0_batch.to(dev)
 

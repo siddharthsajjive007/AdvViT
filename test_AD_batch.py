@@ -18,6 +18,8 @@ import csv
 from simp_batch import SimP, DATASET, DATASET_CONFIGS   # <-- update if your batched file has a different name
 from skimage.metrics import structural_similarity as ssim_fn
 from skimage.metrics import peak_signal_noise_ratio as psnr_fn
+import lpips
+
 
 device = torch.device('cuda', 0)
 print('CUDA available:', torch.cuda.is_available())
@@ -28,20 +30,20 @@ CHANGE DATASET IN SIMP_BATCH AND MODEL_ARCH AND ZIP_PATH HERE
 
 '''
 
-MODEL_ARCH = 'resnet18_cifar10'   # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
+MODEL_ARCH = 'resnet50'  # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
 QUERY_LIMIT = 4000
 USE_SIGN_OPT_PLUS = True
 
 # ── how many images total, and how many go through one attack_untargeted_batch call ──
-TOTAL_IMAGES = 100
-INFERENCE_BATCH_SIZE = 50
+TOTAL_IMAGES = 3599
+INFERENCE_BATCH_SIZE = 120
 
-# ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
-ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
+ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
+# ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/GTSRB//GTSRB_test_ataf.zip"
 
 # ------IMAGE SAVE FOLDER PATH-----------------------
-out_dir = '/home/siddarth/AdvViT/OUTPUT/batch_run_cifar'
+out_dir = '/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_all'
 os.makedirs(out_dir, exist_ok=True)
 # ── CSV output path ──
 csv_path = os.path.join(out_dir, f'results_{DATASET}_{MODEL_ARCH}.csv')
@@ -177,16 +179,19 @@ def load_model(model_arch='ViT', device=None):
 print(f"Loading {MODEL_ARCH}...")
 model = load_model(MODEL_ARCH, device)
 attacker = SimP(model, DATASET, image_size=IMAGE_SIZE)
-
 print(f"Loading {TOTAL_IMAGES} images from {ZIP_PATH}...")
 x0_all, filenames_all = load_images_from_zip(ZIP_PATH, IMAGE_SIZE, TOTAL_IMAGES)
-x0_all = x0_all.to(device)
-print(f"Loaded {TOTAL_IMAGES} images.")
+# x0_all stays on CPU intentionally -- only moved to GPU one chunk at a time,
+# so peak GPU memory stays proportional to INFERENCE_BATCH_SIZE, not TOTAL_IMAGES
 
+y0_all_list = []
 with torch.no_grad():
-    y0_all = attacker.get_label_batch(x0_all)  # one batched forward pass for every clean label at once
-print(f"Clean predictions: {y0_all.tolist()}")
-
+    for start in range(0, TOTAL_IMAGES, INFERENCE_BATCH_SIZE):
+        end = min(start + INFERENCE_BATCH_SIZE, TOTAL_IMAGES)
+        y0_all_list.append(attacker.get_label_batch(x0_all[start:end].to(device)))
+y0_all = torch.cat(y0_all_list, dim=0).to(device)   # explicit .to(device) -- guaranteed GPU regardless of what get_label_batch returns
+print(f"Clean predictions computed for {TOTAL_IMAGES} images")
+del y0_all_list
 patch_num = IMAGE_SIZE // PATCH_SIZE
 
 
@@ -197,6 +202,9 @@ all_successes = []
 all_queries = []
 all_ssim = []
 all_psnr = []
+all_linf = []
+all_lpips = []
+
 
 num_chunks = math.ceil(TOTAL_IMAGES / INFERENCE_BATCH_SIZE)
 t_start_total = time.time()
@@ -233,15 +241,30 @@ for chunk_idx in range(num_chunks):
         dist = float(distortion_chunk[i].item())
         nq = int(queries_chunk[i].item())
 
+         # ---- L-infinity distortion (max pixel-wise change, torch tensors -- more precise than the numpy round-trip) ----
+        linf_val = (adv_chunk[i] - x0_chunk[i]).abs().max().item()
+
+        # ============= lpips ==================================
+        loss_fn_lpips = lpips.LPIPS(net='alex').to(device)
+        with torch.no_grad():
+            img1_lpips = (x0_chunk[i].unsqueeze(0) * 2 - 1).to(device)
+            img2_lpips = (adv_chunk[i].unsqueeze(0).clamp(0, 1) * 2 - 1).to(device)
+            lpips_val = loss_fn_lpips(img1_lpips, img2_lpips).item()
+
+
         all_successes.append(succ)
         all_queries.append(nq)
         if succ:
             all_distortions.append(dist)
             all_ssim.append(ssim_val)
             all_psnr.append(psnr_val)
+            all_linf.append(linf_val)
+            all_lpips.append(lpips_val)
+
+
 
         print(f'  [{global_idx}] {files_chunk[i]}  success={succ}  '
-              f'L2={dist:.4f}  queries={nq}  SSIM={ssim_val:.4f}  PSNR={psnr_val:.2f}dB  '
+              f'L2={dist:.4f}   Linf={linf_val:.4f}  LPIPS={lpips_val:.4f}  queries={nq}  SSIM={ssim_val:.4f}  PSNR={psnr_val:.2f}dB  '
               f'orig_class={y0_chunk[i].item()}  adv_class={adv_pred_chunk[i].item()}')
         
         csv_rows.append({
@@ -249,6 +272,8 @@ for chunk_idx in range(num_chunks):
             'filename': files_chunk[i],
             'asr': succ,
             'l2_distortion': dist,
+            'linf_distortion': linf_val,
+            'lpips': lpips_val,
             'queries': nq,
             'ssim': ssim_val,
             'psnr': psnr_val,
@@ -263,8 +288,9 @@ for chunk_idx in range(num_chunks):
         axes[0].imshow(ori_np); axes[0].set_title(f'Original\n(class {y0_chunk[i].item()})'); axes[0].axis('off')
         axes[1].imshow(adv_np); axes[1].set_title(f'Adversarial\n(class {adv_pred_chunk[i].item()})'); axes[1].axis('off')
         axes[2].imshow(diff_vis); axes[2].set_title('Perturbation'); axes[2].axis('off')
-        fig.suptitle(f'L2={dist:.3f}  SSIM={ssim_val:.4f}  PSNR={psnr_val:.2f}dB', fontsize=11)
-        plt.tight_layout()
+        fig.suptitle(f'L2={dist:.3f}  Linf={linf_val:.3f}  LPIPS={lpips_val:.4f} '    
+                     f'SSIM={ssim_val:.4f}  PSNR={psnr_val:.2f}dB  queries={nq}', fontsize=10)
+        plt.tight_layout(rect=[0, 0, 1, 0.90])
         fig.savefig(os.path.join(out_dir, f'img{global_idx}_{DATASET}_{MODEL_ARCH}.png'), dpi=150, bbox_inches='tight')
         plt.close(fig)
 
@@ -280,6 +306,8 @@ csv_rows.append({
     'filename': '',
     'asr': f'{sum(all_successes)}/{TOTAL_IMAGES}',
     'l2_distortion': round(np.mean(all_distortions), 4) if all_distortions else '',
+    'linf_distortion': round(np.mean(all_linf), 4) if all_linf else '',
+    'lpips': round(np.mean(all_lpips), 4) if all_lpips else '',
     'queries': round(np.mean(all_queries)),
     'ssim': round(np.mean(all_ssim), 4) if all_ssim else '',
     'psnr': round(np.mean(all_psnr), 2) if all_psnr else '',
@@ -312,7 +340,8 @@ print(f'Results saved to: {out_dir}')
 # ── write per-image results to CSV ──
 with open(csv_path, 'w', newline='') as f:
     writer = csv.DictWriter(f, fieldnames=[
-        'index', 'filename', 'asr', 'l2_distortion', 'queries', 'ssim', 'psnr', 'orig_class', 'adv_class', 'total_time_seconds'
+    'index', 'filename', 'asr', 'l2_distortion', 'linf_distortion', 'lpips',
+    'queries', 'ssim', 'psnr', 'orig_class', 'adv_class', 'total_time_seconds'
     ])
     writer.writeheader()
     writer.writerows(csv_rows)
