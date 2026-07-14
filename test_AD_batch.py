@@ -212,8 +212,8 @@ t_start_total = time.time()
 for chunk_idx in range(num_chunks):
     start = chunk_idx * INFERENCE_BATCH_SIZE
     end = min(start + INFERENCE_BATCH_SIZE, TOTAL_IMAGES)
-    x0_chunk = x0_all[start:end]
-    y0_chunk = y0_all[start:end]
+    x0_chunk = x0_all[start:end].to(device)
+    y0_chunk = y0_all[start:end].to(device)
     files_chunk = filenames_all[start:end]
 
     print(f"\n=== Chunk {chunk_idx+1}/{num_chunks}: images {start}-{end-1} "
