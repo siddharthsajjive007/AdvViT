@@ -37,16 +37,16 @@ QUERY_LIMIT = 4000
 USE_SIGN_OPT_PLUS = True
 
 # ── how many images total, and how many go through one attack_untargeted_batch call ──
-TOTAL_IMAGES = 100
+TOTAL_IMAGES = 200
 # Max safe on RTX 3090 24GB for this batched Sign-OPT path (~16GB peak near 1025)
-INFERENCE_BATCH_SIZE = 100
+INFERENCE_BATCH_SIZE = 200
 
 ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/GTSRB//GTSRB_test_ataf.zip"
 
 # ------IMAGE SAVE FOLDER PATH-----------------------
-out_dir = '/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_100'
+out_dir = f'/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_{INFERENCE_BATCH_SIZE}'
 os.makedirs(out_dir, exist_ok=True)
 ori_dir = os.path.join(out_dir, 'ori')
 adv_dir = os.path.join(out_dir, 'adv')
@@ -299,7 +299,6 @@ for chunk_idx in range(num_chunks):
         ori_filename = f'ori_{global_idx}_{DATASET}_{MODEL_ARCH}.png'
         adv_filename = f'adv_{global_idx}_{DATASET}_{MODEL_ARCH}.png'
 
-        np.save(os.path.join(adv_dir, adv_filename.replace('.png', '.npy')), adv_np)
 
         plt.imsave(os.path.join(ori_dir, ori_filename), ori_np)
         plt.imsave(os.path.join(adv_dir, adv_filename), adv_np)

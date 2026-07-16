@@ -1039,5 +1039,14 @@ class SimP:
                       f"mean_distortion={mean_gg:.4f}  mean_queries={query_count.float().mean().item():.0f}")
 
         adv_final, prub_final = self.generate_adv_batch(x0_batch, patch_num, gg_dct.view(B,1,1,1) * xg)
-        success = found_initial.clone()   # AN IMAGE COUNTS AS "SUCCESSFUL" IFF PHASE 1 FOUND ANY WORKING DIRECTION AT ALL
+        # ---- FINAL VERIFICATION: does the actual returned adv image still fool the model? ----
+        # This is the true, in-memory ASR check -- same guarantee as the .npy lossless test,
+        # done live here so there's no need for a separate diagnostic or disk round-trip to
+        # trust the number. Also catches the case where Phase 2's line search accepted a
+        # candidate based on smaller perturbation SIZE alone without re-confirming it still
+        # fools the model (the hi bracket in _bisect_batch is never itself re-verified before
+        # being returned/accepted).
+        final_pred = self.get_label_batch(adv_final)
+        success = (final_pred != y0_batch) & found_initial   # must BOTH have found a direction in Phase 1 AND still fool the model right now
+        query_count += 1 
         return adv_final, gg, success, query_count, prub_final
