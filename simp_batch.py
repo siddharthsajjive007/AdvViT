@@ -13,7 +13,7 @@ from scipy.fftpack import dct, idct
 from numpy import linalg as LA
 
 
-DATASET = "IMAGENET_3599"      # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
+DATASET = "IMAGENET_3599"          # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
 
 # mean and std for different datasets
 IMAGENET_SIZE = 224
@@ -69,9 +69,9 @@ DATASET_CONFIGS = {
 }
 
 
-trf = T.Compose([T.ToPILImage(),
-				 T.ToTensor(),
-				 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+# trf = T.Compose([T.ToPILImage(),
+# 				 T.ToTensor(),
+# 				 T.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
 unloader = T.ToPILImage()
 
 device = torch.device('cuda',0)

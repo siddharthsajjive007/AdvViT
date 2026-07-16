@@ -19,35 +19,47 @@ from simp_batch import SimP, DATASET, DATASET_CONFIGS   # <-- update if your bat
 from skimage.metrics import structural_similarity as ssim_fn
 from skimage.metrics import peak_signal_noise_ratio as psnr_fn
 import lpips
-
+import cv2
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
 
 device = torch.device('cuda', 0)
 print('CUDA available:', torch.cuda.is_available())
 print('Device:', device)
 
 '''
-CHANGE DATASET IN SIMP_BATCH AND MODEL_ARCH AND ZIP_PATH HERE
+CHANGE DATASET IN SIMP_BATCH THEN CHANGE FOLDER NAME, MODEL_ARCH AND ZIP_PATH HERE
 
 '''
 
-MODEL_ARCH = 'resnet50'  # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
+MODEL_ARCH = 'resnet50'       # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
 QUERY_LIMIT = 4000
 USE_SIGN_OPT_PLUS = True
 
 # ── how many images total, and how many go through one attack_untargeted_batch call ──
-TOTAL_IMAGES = 3599
-INFERENCE_BATCH_SIZE = 120
+TOTAL_IMAGES = 100
+# Max safe on RTX 3090 24GB for this batched Sign-OPT path (~16GB peak near 1025)
+INFERENCE_BATCH_SIZE = 100
 
 ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/GTSRB//GTSRB_test_ataf.zip"
 
 # ------IMAGE SAVE FOLDER PATH-----------------------
-out_dir = '/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_all'
+out_dir = '/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_100'
 os.makedirs(out_dir, exist_ok=True)
+ori_dir = os.path.join(out_dir, 'ori')
+adv_dir = os.path.join(out_dir, 'adv')
+os.makedirs(ori_dir, exist_ok=True)
+os.makedirs(adv_dir, exist_ok=True)
 # ── CSV output path ──
 csv_path = os.path.join(out_dir, f'results_{DATASET}_{MODEL_ARCH}.csv')
 csv_rows = []
+ori_csv_path = os.path.join(ori_dir, 'labels.csv')
+adv_csv_path = os.path.join(adv_dir, 'labels.csv')
+ori_label_rows = []
+adv_label_rows = []
+#==============================================================================
 
 config = DATASET_CONFIGS[DATASET]
 IMAGE_SIZE = config['size']
@@ -62,8 +74,8 @@ MODEL_ARCH_DATASET = {
     'resnet50': 'IMAGENET_3599', 'DeiT_T': 'IMAGENET_3599', 'DeiT_S': 'IMAGENET_3599',
     'DeiT_B': 'IMAGENET_3599', 'ViT': 'IMAGENET_3599',
     'resnet18_cifar10': 'CIFAR', 'resnet50_cifar10': 'CIFAR', 'deit_cifar10': 'CIFAR',
-    'resnet50_gtsrb32': 'GTSRB',
-}
+    'resnet50_gtsrb32': 'GTSRB'}
+
 _expected = MODEL_ARCH_DATASET.get(MODEL_ARCH)
 if _expected is not None and _expected != DATASET:
     raise ValueError(
@@ -89,17 +101,24 @@ if _zip_keywords and not any(kw in ZIP_PATH.lower() for kw in _zip_keywords):
 
 #================================END OF CHECK===================================================
 
-
+# NOW ALSO RETURNS THE ORIGINAL LABELS FROM THE CSV FILE
 
 def load_images_from_zip(zip_path, image_size, num_images):
     """
     Loads the first num_images images (sorted by filename, for consistent
-    ordering across runs) from the zip's images/ folder.
+    ordering across runs) from the zip's images/ folder, along with their
+    GROUND-TRUTH original_label from the zip's own labels.csv.
     Returns:
         x0_batch: [num_images, 3, image_size, image_size] CPU tensor, range [0,1]
-        chosen_files: list of filenames used, same order as x0_batch's rows
+        chosen_files: list of filenames used (bare, no 'images/' prefix), same order as x0_batch's rows
+        y0_batch: [num_images] LongTensor of ground-truth original_label values, same order
     """
     with zipfile.ZipFile(zip_path, 'r') as z:
+        # ---- read the ground-truth label CSV bundled in the zip ----
+        with z.open('labels.csv') as f:
+            reader = csv.DictReader(line.decode('utf-8') for line in f)
+            label_lookup = {row['filename']: int(row['original_label']) for row in reader}
+
         image_files = sorted(
             f for f in z.namelist()
             if f.startswith('images/') and f.lower().endswith(('.jpeg', '.jpg', '.png'))
@@ -109,15 +128,20 @@ def load_images_from_zip(zip_path, image_size, num_images):
                 f"Requested {num_images} images but the zip only contains {len(image_files)} "
                 f"under 'images/'."
             )
-        chosen_files = image_files[:num_images]
+        chosen_files_full = image_files[:num_images]          # e.g. 'images/ILSVRC2012_val_00048454.JPEG'
+        chosen_files = [f.split('/', 1)[1] for f in chosen_files_full]  # strip 'images/' prefix to match labels.csv
 
         imgs = []
-        for fname in chosen_files:
-            with z.open(fname) as f:
+        labels = []
+        for full_path, bare_name in zip(chosen_files_full, chosen_files):
+            if bare_name not in label_lookup:
+                raise KeyError(f"'{bare_name}' has no entry in labels.csv -- can't get its ground-truth label.")
+            with z.open(full_path) as f:
                 img = Image.open(f).convert('RGB').resize((image_size, image_size))
                 imgs.append(T.ToTensor()(img))
+            labels.append(label_lookup[bare_name])
 
-    return torch.stack(imgs), chosen_files
+    return torch.stack(imgs), chosen_files, torch.tensor(labels, dtype=torch.long)
 
 
 def load_model(model_arch='ViT', device=None):
@@ -180,20 +204,11 @@ print(f"Loading {MODEL_ARCH}...")
 model = load_model(MODEL_ARCH, device)
 attacker = SimP(model, DATASET, image_size=IMAGE_SIZE)
 print(f"Loading {TOTAL_IMAGES} images from {ZIP_PATH}...")
-x0_all, filenames_all = load_images_from_zip(ZIP_PATH, IMAGE_SIZE, TOTAL_IMAGES)
-# x0_all stays on CPU intentionally -- only moved to GPU one chunk at a time,
-# so peak GPU memory stays proportional to INFERENCE_BATCH_SIZE, not TOTAL_IMAGES
-
-y0_all_list = []
-with torch.no_grad():
-    for start in range(0, TOTAL_IMAGES, INFERENCE_BATCH_SIZE):
-        end = min(start + INFERENCE_BATCH_SIZE, TOTAL_IMAGES)
-        y0_all_list.append(attacker.get_label_batch(x0_all[start:end].to(device)))
-y0_all = torch.cat(y0_all_list, dim=0).to(device)   # explicit .to(device) -- guaranteed GPU regardless of what get_label_batch returns
-print(f"Clean predictions computed for {TOTAL_IMAGES} images")
-del y0_all_list
+print(f"Loading {TOTAL_IMAGES} images from {ZIP_PATH}...")
+x0_all, filenames_all, y0_all = load_images_from_zip(ZIP_PATH, IMAGE_SIZE, TOTAL_IMAGES)
+y0_all = y0_all.to(device)
+print(f"Loaded {TOTAL_IMAGES} images with ground-truth labels from labels.csv.")
 patch_num = IMAGE_SIZE // PATCH_SIZE
-
 
 
 # ── aggregate stats, same convention as run_simp.py ──
@@ -205,6 +220,7 @@ all_psnr = []
 all_linf = []
 all_lpips = []
 
+loss_fn_lpips = lpips.LPIPS(net='alex').to(device)
 
 num_chunks = math.ceil(TOTAL_IMAGES / INFERENCE_BATCH_SIZE)
 t_start_total = time.time()
@@ -245,7 +261,6 @@ for chunk_idx in range(num_chunks):
         linf_val = (adv_chunk[i] - x0_chunk[i]).abs().max().item()
 
         # ============= lpips ==================================
-        loss_fn_lpips = lpips.LPIPS(net='alex').to(device)
         with torch.no_grad():
             img1_lpips = (x0_chunk[i].unsqueeze(0) * 2 - 1).to(device)
             img2_lpips = (adv_chunk[i].unsqueeze(0).clamp(0, 1) * 2 - 1).to(device)
@@ -280,7 +295,18 @@ for chunk_idx in range(num_chunks):
             'orig_class': y0_chunk[i].item(),
             'adv_class': adv_pred_chunk[i].item()
         })
+        #===================SAVING ORIGINAL AND ADV IMAGES==========================
+        ori_filename = f'ori_{global_idx}_{DATASET}_{MODEL_ARCH}.png'
+        adv_filename = f'adv_{global_idx}_{DATASET}_{MODEL_ARCH}.png'
 
+        np.save(os.path.join(adv_dir, adv_filename.replace('.png', '.npy')), adv_np)
+
+        plt.imsave(os.path.join(ori_dir, ori_filename), ori_np)
+        plt.imsave(os.path.join(adv_dir, adv_filename), adv_np)
+
+        ori_label_rows.append({'filename': ori_filename, 'label': y0_chunk[i].item()})
+        adv_label_rows.append({'filename': adv_filename, 'label': adv_pred_chunk[i].item()})
+        #=================================================================================
 
         fig, axes = plt.subplots(1, 3, figsize=(13, 5))
         diff = adv_np - ori_np
@@ -327,10 +353,12 @@ print(f'Total time:        {total_elapsed:.1f}s ({total_elapsed/60:.2f} min), '
 print(f'asr:      {sum(all_successes)}/{TOTAL_IMAGES} '
       f'({100*sum(all_successes)/TOTAL_IMAGES:.1f}%)')
 if all_distortions:
-    print(f'Avg L2 distortion (successes only):    {np.mean(all_distortions):.4f}')
-    print(f'Median L2 distortion (successes only):  {np.median(all_distortions):.4f}')
-    print(f'Avg SSIM (successes only):              {np.mean(all_ssim):.4f}')
-    print(f'Avg PSNR (successes only):              {np.mean(all_psnr):.2f} dB')
+    print(f'Avg L2 distortion      :    {np.mean(all_distortions):.4f}')
+    print(f'Median L2 distortion   :    {np.median(all_distortions):.4f}')
+    print(f'Avg Linf distortion    :    {np.mean(all_linf):.4f}')
+    print(f'Avg LPIPS              :    {np.mean(all_ssim):.4f}')
+    print(f'Avg SSIM               :    {np.mean(all_lpips):.4f}')
+    print(f'Avg PSNR               :    {np.mean(all_psnr):.2f} dB')
 else:
     print('No successful attacks -- no distortion/SSIM/PSNR stats to report.')
 print(f'Avg queries used (all images):    {np.mean(all_queries):.0f}')
@@ -345,5 +373,18 @@ with open(csv_path, 'w', newline='') as f:
     ])
     writer.writeheader()
     writer.writerows(csv_rows)
-
 print(f'Per-image results saved to: {csv_path}')
+
+# -----write ori and adv label csv--------------------------
+with open(ori_csv_path, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=['filename', 'label'])
+    writer.writeheader()
+    writer.writerows(ori_label_rows)
+
+with open(adv_csv_path, 'w', newline='') as f:
+    writer = csv.DictWriter(f, fieldnames=['filename', 'label'])
+    writer.writeheader()
+    writer.writerows(adv_label_rows)
+
+print(f'Original image labels saved to: {ori_csv_path}')
+print(f'Adversarial image labels saved to: {adv_csv_path}')
