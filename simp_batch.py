@@ -302,7 +302,7 @@ class SimP:
         if success_flag == False:                            #(FALLBACK) IF NONE OF THE GENERATED DIRECTION FOOLS THE MODEL
             for j in range(patch_num):
                 for k in range(patch_num):
-                    dct_mask[:,j*patch_size:j*patch_size+dimen_size,k*patch_size:k*patch_size+dimen_size] = 1      #SCRAPS THE ORIGINAL VARIANCE WEIGHTED MASK AND GIVES A SIMPLE 1 MASK
+                    dct_mask[:,j*patch_size:j*patch_size+dimen_size,k*patch_size:k*patch_size+dimen_size] = 1   #SCRAPS THE ORIGINAL VARIANCE WEIGHTED MASK AND GIVES A SIMPLE 1 MASK
             for i in range(query_limit - query_count):
                 query_count += 1
                 dct_theta = np.random.randn(*np.array(x0).shape) # gaussian distortion
@@ -836,35 +836,62 @@ class SimP:
         # print(f"Bisect point after margin factor: {hi} ")
         return hi, best_l2, total_q
     @torch.no_grad()
-    def sign_grad_batch(self, x0_batch, y0_batch, patch_num, theta_dct, initial_lbd_dct, dct_mask, h, active):
-        # BATCHED VERSION OF sign_grad_v1 -- SAME K=200 RANDOM PROBES, SAME
-        # SIGN-FLIP LOGIC (Eq. 11-12), BUT EVERY PROBE'S QUERY NOW COVERS ALL B
-        # IMAGES IN ONE MODEL CALL INSTEAD OF ONE IMAGE AT A TIME. THE K-LOOP
-        # ITSELF IS STILL SEQUENTIAL (200 PASSES), BUT EACH PASS IS NOW B TIMES
-        # CHEAPER PER-IMAGE THAN THE ORIGINAL SINCE IT'S ONE BATCHED GPU CALL
-        # INSTEAD OF B SEPARATE ONES. h CAN BE A SCALAR OR A [B] TENSOR (SINCE
-        # THE OUTER LOOP SHRINKS beta PER-IMAGE ON A STUCK OPTIMIZER, NOT GLOBALLY).
+    def sign_grad_batch(self, x0_batch, y0_batch, patch_num, theta_dct, initial_lbd_dct, dct_mask, h, active,
+                         probes_per_round=20):
+        # RESTRUCTURED VERSION -- SAME K=200 TOTAL RANDOM PROBES, SAME SIGN-FLIP
+        # LOGIC (Eq. 11-12), BUT NOW TESTS `probes_per_round` PROBES PER IMAGE
+        # SIMULTANEOUSLY PER ROUND INSTEAD OF 1 PROBE/IMAGE/ROUND ACROSS 200
+        # FULLY SEQUENTIAL ROUNDS. SAME TOTAL QUERY COUNT (K), FAR FEWER
+        # SEQUENTIAL GPU CALLS -- THIS IS PURELY A SPEED CHANGE, THE STATISTICAL
+        # QUALITY OF THE GRADIENT ESTIMATE IS UNCHANGED (same K samples averaged,
+        # just computed in bigger batched chunks). h CAN BE SCALAR OR [B].
+        # MEMORY NOTE: each round holds B*probes_per_round full image tensors at
+        # once -- tune probes_per_round down if this OOMs at your batch size.
         B = x0_batch.shape[0]
         K = self.k   # 200
+        P = probes_per_round
+        num_rounds = (K + P - 1) // P
         sign_grad = torch.zeros_like(theta_dct)
         h_ = h.view(B,1,1,1) if torch.is_tensor(h) else h
-        for _ in range(K):
-            u = torch.randn_like(theta_dct) * dct_mask                # mu(j) = mu(j) * M(mask), SAME AS SEQUENTIAL
-            u = u / u.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)   # NORMALIZED, PER IMAGE
-            new_theta = theta_dct + h_ * u                            # theta' + epsilon*mu(j)
-            new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(B,1,1,1)
-            adv, _ = self.generate_adv_batch(x0_batch, patch_num, initial_lbd_dct.view(B,1,1,1) * new_theta)
-            adv_class, _ = self.get_results_batch(adv)                # ONE QUERY, WHOLE BATCH AT ONCE
-            sign = torch.where(adv_class != y0_batch, torch.tensor(-1.0, device=x0_batch.device),
-                                                        torch.tensor(1.0, device=x0_batch.device))  # ADVERSARIAL -> -1, PER IMAGE
-            sign_grad += u * sign.view(B,1,1,1)                        # ACCUMULATE SIGNED DIRECTION, PER IMAGE
-        sign_grad /= K                                                  # (1/J) NORMALIZE, PER IMAGE
+
+        for round_idx in range(num_rounds):
+            this_round_size = min(P, K - round_idx * P)
+
+            x0_r = x0_batch.unsqueeze(1).expand(B, this_round_size, 3, self.image_size, self.image_size) \
+                            .reshape(B * this_round_size, 3, self.image_size, self.image_size)
+            y0_r = y0_batch.unsqueeze(1).expand(B, this_round_size).reshape(B * this_round_size)
+            mask_r = dct_mask.unsqueeze(1).expand(B, this_round_size, 3, self.image_size, self.image_size) \
+                              .reshape(B * this_round_size, 3, self.image_size, self.image_size)
+            theta_r = theta_dct.unsqueeze(1).expand(B, this_round_size, 3, self.image_size, self.image_size) \
+                                .reshape(B * this_round_size, 3, self.image_size, self.image_size)
+            lbd_r = initial_lbd_dct.unsqueeze(1).expand(B, this_round_size).reshape(B * this_round_size)
+            if torch.is_tensor(h):
+                h_r = h.view(B, 1, 1, 1, 1).expand(B, this_round_size, 1, 1, 1) \
+                       .reshape(B * this_round_size, 1, 1, 1)
+            else:
+                h_r = h
+
+            u = torch.randn_like(x0_r) * mask_r
+            u = u / u.flatten(1).norm(dim=1).clamp_min(1e-12).view(-1,1,1,1)
+            new_theta = theta_r + h_r * u
+            new_theta = new_theta / new_theta.flatten(1).norm(dim=1).clamp_min(1e-12).view(-1,1,1,1)
+
+            adv, _ = self.generate_adv_batch(x0_r, patch_num, lbd_r.view(-1,1,1,1) * new_theta)
+            adv_class, _ = self.get_results_batch(adv)
+            sign = torch.where(adv_class != y0_r, torch.tensor(-1.0, device=x0_batch.device),
+                                                    torch.tensor(1.0, device=x0_batch.device))
+
+            u_r = u.view(B, this_round_size, 3, self.image_size, self.image_size)
+            sign_r = sign.view(B, this_round_size, 1, 1, 1)
+            sign_grad += (u_r * sign_r).sum(dim=1)
+
+        sign_grad /= K
         return sign_grad
-    
+        
     @torch.no_grad()
     def attack_untargeted_batch(self, x0_batch, y0_batch, patch_num, alpha=0.2, beta=0.001,
                                  iterations=1000, query_limit=4000, use_sign_opt_plus=False,
-                                 num_directions=200, bisect_iters=20, bisect_iters_local=15,  
+                                 num_directions=100, bisect_iters=20, directions_per_round=10, bisect_iters_local=15,  
                                  dimen_size=None, alp=4, verbose_every=10):
         # BATCHED VERSION OF attack_untargeted -- SAME TWO PHASES (RANDOM DIRECTION
         # SEARCH, THEN GRADIENT DESCENT), SAME OVERALL LOGIC, JUST EVERY VARIABLE
@@ -881,7 +908,7 @@ class SimP:
             dimen_size = DATASET_CONFIGS[self.dataset]['dimen_size']
         patch_size = int(self.image_size / patch_num)
 
-        dct_mask = self.Mask_weight_batch(x0_batch, dimen_size, alp, patch_size)  # ONE MASK M PER IMAGE, BUILT ONCE
+        dct_mask = self.Mask_weight_batch(x0_batch, dimen_size, alp, patch_size)             # ONE MASK M PER IMAGE, BUILT ONCE
 
         # ---- PHASE 1: INITIAL DIRECTION SEARCH, BATCHED ----
         # SAME AS THE SEQUENTIAL VERSION'S "for i in range(num_directions):" LOOP --
@@ -889,33 +916,94 @@ class SimP:
         # SMALLEST DISTORTION PER IMAGE. NO EARLY EXIT HERE EITHER IN THE
         # SEQUENTIAL VERSION -- ALL num_directions ALWAYS GET TRIED, SO THIS
         # BATCHES CLEANLY WITHOUT NEEDING ANY PER-IMAGE SKIP LOGIC.
-        print(f"[batch] Searching for initial direction on {num_directions} random directions, batch size {B}...")
+        # print(f"[batch] Searching for initial direction on {num_directions} random directions, batch size {B}...")
+        # query_count = torch.zeros(B, dtype=torch.long, device=dev)
+        # g_theta = torch.full((B,), float('inf'), device=dev)       # BEST DISTORTION FOUND SO FAR, PER IMAGE
+        # g_dct = torch.full((B,), float('inf'), device=dev)          # BEST LAMBDA (DCT SCALE) FOR THAT DIRECTION
+        # best_theta_dct = torch.zeros_like(x0_batch)                 # BEST THETA'/||THETA'|| SO FAR, PER IMAGE
+
+        # for _ in range(num_directions):
+        #     query_count += 1
+        #     theta = torch.randn_like(x0_batch) * dct_mask           # theta' = theta * M, FOR EVERY IMAGE AT ONCE
+        #     adv, prub = self.generate_adv_batch(x0_batch, patch_num, theta)
+        #     adv_class, _ = self.get_results_batch(adv)
+        #     succeeded = (adv_class != y0_batch)                     # PER-IMAGE: DID THIS RANDOM DIRECTION FOOL THE MODEL?
+        #     if not succeeded.any():
+        #         continue                                             # NOBODY IN THE BATCH SUCCEEDED THIS ROUND, SKIP THE REFINE STEP
+
+        #     theta_norm = theta.flatten(1).norm(dim=1).clamp_min(1e-12)   # ||theta'||, PER IMAGE
+        #     theta_unit = theta / theta_norm.view(B,1,1,1)                # theta'/||theta'||, PER IMAGE
+
+        #     # REFINE ONLY THE IMAGES THAT SUCCEEDED THIS ROUND (active=succeeded) --
+        #     # OTHER IMAGES' ROWS ARE PASSED THROUGH UNTOUCHED INSIDE _bisect_batch.
+        #     hi, best_l2, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, theta_unit,
+        #                                              hi=theta_norm, active=succeeded, n_iters=bisect_iters)
+        #     query_count += bs_q
+        #     improved = succeeded & (best_l2 < g_theta)               # IS THIS DIRECTION BETTER THAN THE BEST FOUND SO FAR FOR THIS IMAGE?
+        #     g_theta = torch.where(improved, best_l2, g_theta)
+        #     g_dct = torch.where(improved, hi, g_dct)
+        #     best_theta_dct = torch.where(improved.view(B,1,1,1), theta_unit, best_theta_dct)
+
+        # found_initial = (g_theta < float('inf'))
+
+
+        D = directions_per_round
+        num_rounds = (num_directions + D - 1) // D
+        print(f"[batch] Searching for initial direction: {num_rounds} rounds x up to {D} "
+              f"candidates/round ({num_directions} total attempts), batch size {B}...")
+
         query_count = torch.zeros(B, dtype=torch.long, device=dev)
-        g_theta = torch.full((B,), float('inf'), device=dev)       # BEST DISTORTION FOUND SO FAR, PER IMAGE
-        g_dct = torch.full((B,), float('inf'), device=dev)          # BEST LAMBDA (DCT SCALE) FOR THAT DIRECTION
-        best_theta_dct = torch.zeros_like(x0_batch)                 # BEST THETA'/||THETA'|| SO FAR, PER IMAGE
+        g_theta = torch.full((B,), float('inf'), device=dev)
+        g_dct = torch.full((B,), float('inf'), device=dev)
+        best_theta_dct = torch.zeros_like(x0_batch)
 
-        for _ in range(num_directions):
-            query_count += 1
-            theta = torch.randn_like(x0_batch) * dct_mask           # theta' = theta * M, FOR EVERY IMAGE AT ONCE
-            adv, prub = self.generate_adv_batch(x0_batch, patch_num, theta)
+        for round_idx in range(num_rounds):
+            this_round_size = min(D, num_directions - round_idx * D)
+            query_count += this_round_size   # one initial check per candidate, per image
+
+            # Expand each image into `this_round_size` copies so every candidate direction
+            # for every image is tested in ONE batched call instead of `this_round_size`
+            # separate sequential rounds. Same total num_directions attempts, far fewer
+            # sequential GPU calls -- pure speed change, same as sign_grad_batch's restructuring.
+            x0_r = x0_batch.unsqueeze(1).expand(B, this_round_size, 3, self.image_size, self.image_size) \
+                            .reshape(B * this_round_size, 3, self.image_size, self.image_size)
+            y0_r = y0_batch.unsqueeze(1).expand(B, this_round_size).reshape(B * this_round_size)
+            mask_r = dct_mask.unsqueeze(1).expand(B, this_round_size, 3, self.image_size, self.image_size) \
+                              .reshape(B * this_round_size, 3, self.image_size, self.image_size)
+
+            theta = torch.randn_like(x0_r) * mask_r
+            adv, prub = self.generate_adv_batch(x0_r, patch_num, theta)
             adv_class, _ = self.get_results_batch(adv)
-            succeeded = (adv_class != y0_batch)                     # PER-IMAGE: DID THIS RANDOM DIRECTION FOOL THE MODEL?
+            succeeded = (adv_class != y0_r)
             if not succeeded.any():
-                continue                                             # NOBODY IN THE BATCH SUCCEEDED THIS ROUND, SKIP THE REFINE STEP
+                continue
 
-            theta_norm = theta.flatten(1).norm(dim=1).clamp_min(1e-12)   # ||theta'||, PER IMAGE
-            theta_unit = theta / theta_norm.view(B,1,1,1)                # theta'/||theta'||, PER IMAGE
+            theta_norm = theta.flatten(1).norm(dim=1).clamp_min(1e-12)
+            theta_unit = theta / theta_norm.view(-1, 1, 1, 1)
 
-            # REFINE ONLY THE IMAGES THAT SUCCEEDED THIS ROUND (active=succeeded) --
-            # OTHER IMAGES' ROWS ARE PASSED THROUGH UNTOUCHED INSIDE _bisect_batch.
-            hi, best_l2, bs_q = self._bisect_batch(x0_batch, y0_batch, patch_num, theta_unit,
+            hi, best_l2, bs_q = self._bisect_batch(x0_r, y0_r, patch_num, theta_unit,
                                                      hi=theta_norm, active=succeeded, n_iters=bisect_iters)
-            query_count += bs_q
-            improved = succeeded & (best_l2 < g_theta)               # IS THIS DIRECTION BETTER THAN THE BEST FOUND SO FAR FOR THIS IMAGE?
-            g_theta = torch.where(improved, best_l2, g_theta)
-            g_dct = torch.where(improved, hi, g_dct)
-            best_theta_dct = torch.where(improved.view(B,1,1,1), theta_unit, best_theta_dct)
+
+            # bs_q is per-CANDIDATE (B*this_round_size) -- fold back into per-IMAGE query counts
+            query_count += bs_q.view(B, this_round_size).sum(dim=1)
+
+            # Reshape back to (B, this_round_size, ...) and pick each image's best candidate
+            # from this round -- failed candidates masked to inf so they can't win the min.
+            best_l2_r = torch.where(succeeded, best_l2, torch.full_like(best_l2, float('inf'))) \
+                             .view(B, this_round_size)
+            hi_r = hi.view(B, this_round_size)
+            theta_unit_r = theta_unit.view(B, this_round_size, 3, self.image_size, self.image_size)
+
+            round_best_l2, round_best_idx = best_l2_r.min(dim=1)
+            round_improved = round_best_l2 < g_theta
+
+            idx_expand = round_best_idx.view(B, 1, 1, 1, 1).expand(-1, 1, 3, self.image_size, self.image_size)
+            round_best_theta = torch.gather(theta_unit_r, 1, idx_expand).squeeze(1)
+            round_best_hi = torch.gather(hi_r, 1, round_best_idx.view(B, 1)).squeeze(1)
+
+            g_theta = torch.where(round_improved, round_best_l2, g_theta)
+            g_dct = torch.where(round_improved, round_best_hi, g_dct)
+            best_theta_dct = torch.where(round_improved.view(B, 1, 1, 1), round_best_theta, best_theta_dct)
 
         found_initial = (g_theta < float('inf'))
         print(f"[batch] Initial direction found for {found_initial.sum().item()}/{B} images "

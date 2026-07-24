@@ -45,10 +45,10 @@ DIMEN_SIZE = 4                # is 4 for imagenet as per DATASET_CONFIG dictiona
 # margin size scale disabled in bisect batch for this run
 
 # ── how many images total, and how many go through one attack_untargeted_batch call ──
-TOTAL_IMAGES = 3599
+TOTAL_IMAGES = 10
 # Max safe on RTX 3090 24GB for this batched Sign-OPT path (~16GB peak near 1025)
-INFERENCE_BATCH_SIZE = 500
-MODEL_ARCH = 'DeiT_B'      # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
+INFERENCE_BATCH_SIZE = 10
+MODEL_ARCH = 'DeiT_B'     # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
 ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/GTSRB//GTSRB_test_ataf.zip"
@@ -142,7 +142,7 @@ def load_images_from_zip(zip_path, image_size, num_images):
         imgs = []
         labels = []
         for full_path, bare_name in zip(chosen_files_full, chosen_files):
-            if bare_name not in label_lookup:
+            if bare_name not in label_lookup:               # filename : label
                 raise KeyError(f"'{bare_name}' has no entry in labels.csv -- can't get its ground-truth label.")
             with z.open(full_path) as f:
                 img = Image.open(f).convert('RGB').resize((image_size, image_size))
@@ -371,7 +371,6 @@ csv_rows.append({
     'adv_class': '',
     'total_time_seconds': round(total_elapsed, 1),
 })
-
 
 # ── final aggregate report ──
 print('\n' + '=' * 60)
