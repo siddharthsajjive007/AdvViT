@@ -52,7 +52,6 @@ GTSRB_TRANSFORM = T.Compose([
 
 # Single source of truth for everything dataset-dependent: native resolution,
 # normalization stats, and DCT-attack geometry (patch_size, dimen_size).
-#
 # patch_size: kept at 16 for ImageNet (matches ViT tokenization, paper-tuned).
 #   For smaller-resolution datasets, scaled down so patch COUNT stays
 #   reasonably fine-grained (e.g. 32/4=8x8=64 patches, vs 224/16=14x14=196).
@@ -831,6 +830,10 @@ class SimP:
             best_l2 = torch.where(succ, torch.minimum(best_l2, l2), best_l2)
             hi = torch.where(succ, mid, hi)                        # SUCCEEDED -> TIGHTEN THE KNOWN-GOOD SIDE DOWN
             lo = torch.where(succ, lo, mid)                        # FAILED -> TIGHTEN THE KNOWN-BAD SIDE UP
+        # print(f"Bisect point before margin factor: {hi} ")       
+        # margin_factor = 1.003                                      # push 0.3% further past the boundary than the search strictly requires
+        # hi = hi * margin_factor
+        # print(f"Bisect point after margin factor: {hi} ")
         return hi, best_l2, total_q
     @torch.no_grad()
     def sign_grad_batch(self, x0_batch, y0_batch, patch_num, theta_dct, initial_lbd_dct, dct_mask, h, active):
@@ -861,7 +864,7 @@ class SimP:
     @torch.no_grad()
     def attack_untargeted_batch(self, x0_batch, y0_batch, patch_num, alpha=0.2, beta=0.001,
                                  iterations=1000, query_limit=4000, use_sign_opt_plus=False,
-                                 num_directions=100, bisect_iters=20, bisect_iters_local=15,
+                                 num_directions=200, bisect_iters=20, bisect_iters_local=15,  
                                  dimen_size=None, alp=4, verbose_every=10):
         # BATCHED VERSION OF attack_untargeted -- SAME TWO PHASES (RANDOM DIRECTION
         # SEARCH, THEN GRADIENT DESCENT), SAME OVERALL LOGIC, JUST EVERY VARIABLE
@@ -920,7 +923,7 @@ class SimP:
         # IMAGES WITH NO INITIAL DIRECTION FOUND STAY INACTIVE FROM THE START --
         # THEY'LL BE REPORTED AS FAILURES. (NO FALLBACK FLAT-MASK RETRY HERE, UNLIKE
         # THE SEQUENTIAL VERSION'S "if success_flag == False:" BLOCK -- KNOWN GAP,
-        # CAN BE ADDED LATER IF IT TURNS OUT TO MATTER FOR YOUR DATA.)
+        # CAN BE ADDED LATER IF IT TURNS OUT TO MATTER FOR YOUR DATA)
 
         # ---- PHASE 2: GRADIENT DESCENT, BATCHED, PER-IMAGE active MASKING ----
         xg = best_theta_dct.clone()          # xg IS THE BEST (THETA'/||THETA'||), PER IMAGE
@@ -1035,10 +1038,20 @@ class SimP:
             if (i + 1) % verbose_every == 0:
                 finite_gg = gg[torch.isfinite(gg)]
                 mean_gg = finite_gg.mean().item() if finite_gg.numel() > 0 else float('nan')
-                print(f"[batch] iter {i+1:4d}  active={int(active.sum().item())}/{B}  "
+                print(f"[batch] iter {i+1:4d}  active={int(active.sum().item())}/{B}"
                       f"mean_distortion={mean_gg:.4f}  mean_queries={query_count.float().mean().item():.0f}")
 
-        adv_final, prub_final = self.generate_adv_batch(x0_batch, patch_num, gg_dct.view(B,1,1,1) * xg)
+        # in attack_untargeted_batch, right before the final generate_adv_batch call:
+        # This is applying margin factor to the final lambda, instead of applying it to every call on the bisect batch
+        margin_factor = 1.02                # 1.01 to 1.03
+        gg_dct_final = gg_dct * margin_factor   # apply the margin ONCE, not compounded across iterations
+        adv_final, prub_final = self.generate_adv_batch(x0_batch, patch_num, gg_dct_final.view(B,1,1,1) * xg)
+        
+        
+        # adv_final, prub_final = self.generate_adv_batch(x0_batch, patch_num, gg_dct.view(B,1,1,1) * xg)
+        
+        
+        
         # ---- FINAL VERIFICATION: does the actual returned adv image still fool the model? ----
         # This is the true, in-memory ASR check -- same guarantee as the .npy lossless test,
         # done live here so there's no need for a separate diagnostic or disk round-trip to

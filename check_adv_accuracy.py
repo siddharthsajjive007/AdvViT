@@ -20,7 +20,6 @@ import torch
 from PIL import Image
 import torchvision.transforms as T
 import numpy as np
-
 from simp_batch import SimP, DATASET, DATASET_CONFIGS   # <-- update if your batched file has a different name
 
 device = torch.device('cuda', 0)
@@ -28,16 +27,16 @@ print('CUDA available:', torch.cuda.is_available())
 print('Device:', device)
 
 # ── MUST match whatever generated the images you're checking ──
-MODEL_ARCH = 'resnet50'
+MODEL_ARCH = 'DeiT_B'      # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
 CHECK_BATCH_SIZE = 100
 
 # ── folder produced by test_AD_batch.py ──
-out_dir = '/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_200'   # <-- point this at the actual run folder
+out_dir = f'/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_{MODEL_ARCH}_3599(marginend1.02)'   # <-- point this at the actual run folder
 ori_dir = os.path.join(out_dir, 'ori')
 adv_dir = os.path.join(out_dir, 'adv')
 ori_csv_path = os.path.join(ori_dir, 'labels.csv')
 adv_csv_path = os.path.join(adv_dir, 'labels.csv')
-main_results_csv_path = os.path.join(out_dir, f'results_{DATASET}_{MODEL_ARCH}.csv')  # <-- written by test_AD_batch.py
+main_results_csv_path = os.path.join(out_dir, f'results_{DATASET}_{MODEL_ARCH}.csv')             # <-- written by test_AD_batch.py
 
 _cfg = DATASET_CONFIGS[DATASET]
 IMAGE_SIZE = _cfg['size']
@@ -139,7 +138,7 @@ ori_rows = load_labels_csv(ori_csv_path)
 print(f"Reading {adv_csv_path}")
 adv_rows = load_labels_csv(adv_csv_path)
 print(f"Reading {main_results_csv_path}")
-success_by_index = load_main_results_success(main_results_csv_path)
+success_by_index = load_main_results_success(main_results_csv_path)   # {index : True}
 
 assert len(ori_rows) == len(adv_rows), (
     f"ori/labels.csv has {len(ori_rows)} rows but adv/labels.csv has {len(adv_rows)} -- "
@@ -240,3 +239,4 @@ else:
     print('No successful attacks in this run -- nothing to compute adversarial accuracy over.')
 
 print(f'\nPer-image results saved to: {verify_csv_path}')
+

@@ -5,6 +5,8 @@ and reports aggregate stats (success rate, avg/median distortion, avg
 queries) across the whole run, same convention as run_simp.py's
 num_runs/batch_size split.
 """
+import warnings
+warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
 import os
 import math
 import time
@@ -20,8 +22,7 @@ from skimage.metrics import structural_similarity as ssim_fn
 from skimage.metrics import peak_signal_noise_ratio as psnr_fn
 import lpips
 import cv2
-import warnings
-warnings.filterwarnings('ignore', category=UserWarning, module='torchvision')
+
 
 device = torch.device('cuda', 0)
 print('CUDA available:', torch.cuda.is_available())
@@ -31,22 +32,29 @@ print('Device:', device)
 CHANGE DATASET IN SIMP_BATCH THEN CHANGE FOLDER NAME, MODEL_ARCH AND ZIP_PATH HERE
 
 '''
-
-MODEL_ARCH = 'resnet50'       # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
-QUERY_LIMIT = 4000
+#PARAMETERS TO EXPERIMENT
+QUERY_LIMIT = 10000
 USE_SIGN_OPT_PLUS = True
+BISECT_ITERS = 20             #was 20
+BISECT_ITERS_LOCAL = 15        #was 15
+DIMEN_SIZE = 4                # is 4 for imagenet as per DATASET_CONFIG dictionary, if set here this will be 
+                              # the value tested, if the argument is removed or set to 'None' on attack_untargeted_batch
+                              # in this file, it reverts to the config dataset dictionary value
+
+
+# margin size scale disabled in bisect batch for this run
 
 # ── how many images total, and how many go through one attack_untargeted_batch call ──
-TOTAL_IMAGES = 200
+TOTAL_IMAGES = 3599
 # Max safe on RTX 3090 24GB for this batched Sign-OPT path (~16GB peak near 1025)
-INFERENCE_BATCH_SIZE = 200
-
+INFERENCE_BATCH_SIZE = 500
+MODEL_ARCH = 'DeiT_B'      # 'resnet50' | 'DeiT_B' | 'DeiT_S' | 'DeiT_T' | 'resnet18_cifar10' | 'resnet50_gtsrb32'| 'deit_cifar10' | 'ViT'
 ZIP_PATH = "/home/HDD/ATAF/Datasets/ImageNetDataset/ATAF-Framework-Ready/ImageNet-3599-Targeted.zip"   #IMAGENET
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/CIFAR10-Dataset/CIFAR-10-60k-targeted.zip"    #CIFAR10
 # ZIP_PATH = "/home/HDD/ATAF/Datasets/GTSRB//GTSRB_test_ataf.zip"
 
 # ------IMAGE SAVE FOLDER PATH-----------------------
-out_dir = f'/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_{INFERENCE_BATCH_SIZE}'
+out_dir = f'/home/siddarth/AdvViT/OUTPUT/batch_run_imagenet_{MODEL_ARCH}_{TOTAL_IMAGES}(marginend1.02)'
 os.makedirs(out_dir, exist_ok=True)
 ori_dir = os.path.join(out_dir, 'ori')
 adv_dir = os.path.join(out_dir, 'adv')
@@ -204,10 +212,31 @@ print(f"Loading {MODEL_ARCH}...")
 model = load_model(MODEL_ARCH, device)
 attacker = SimP(model, DATASET, image_size=IMAGE_SIZE)
 print(f"Loading {TOTAL_IMAGES} images from {ZIP_PATH}...")
-print(f"Loading {TOTAL_IMAGES} images from {ZIP_PATH}...")
+
 x0_all, filenames_all, y0_all = load_images_from_zip(ZIP_PATH, IMAGE_SIZE, TOTAL_IMAGES)
-y0_all = y0_all.to(device)
-print(f"Loaded {TOTAL_IMAGES} images with ground-truth labels from labels.csv.")
+
+# ---- FILTER: only attack images the model already correctly classifies ----
+# Without this, some images have y0 (ground truth) != model's clean prediction,
+# meaning the "attack" needs zero effort (or none at all) -- these produce
+# degenerate near-zero-distortion results that don't represent genuine attacks.
+clean_pred_list = []
+with torch.no_grad():
+    for start in range(0, TOTAL_IMAGES, INFERENCE_BATCH_SIZE):
+        end = min(start + INFERENCE_BATCH_SIZE, TOTAL_IMAGES)
+        clean_pred_list.append(attacker.get_label_batch(x0_all[start:end].to(device)).cpu())
+clean_pred_all = torch.cat(clean_pred_list, dim=0)
+
+correctly_classified = (clean_pred_all == y0_all)
+
+print(f"Model correctly classifies {correctly_classified.sum().item()}/{len(y0_all)} images "
+      f"before attack -- only attacking those.")
+
+x0_all = x0_all[correctly_classified]
+y0_all = y0_all[correctly_classified]
+filenames_all = [f for f, keep in zip(filenames_all, correctly_classified.tolist()) if keep]
+TOTAL_IMAGES = x0_all.shape[0]   # update to reflect the actual, filtered count
+
+print(f"Proceeding with {TOTAL_IMAGES} images.")
 patch_num = IMAGE_SIZE // PATCH_SIZE
 
 
@@ -237,8 +266,10 @@ for chunk_idx in range(num_chunks):
     t0 = time.time()
     adv_chunk, distortion_chunk, success_chunk, queries_chunk, prub_chunk = attacker.attack_untargeted_batch(
         x0_chunk, y0_chunk, patch_num,
-        query_limit=QUERY_LIMIT, use_sign_opt_plus=USE_SIGN_OPT_PLUS,
-    )
+        query_limit=QUERY_LIMIT, use_sign_opt_plus=USE_SIGN_OPT_PLUS, bisect_iters=BISECT_ITERS, 
+        bisect_iters_local=BISECT_ITERS_LOCAL,   # was 15, trying for lower values to converge less on to the boundary
+        dimen_size=DIMEN_SIZE
+        )
     elapsed = time.time() - t0
     n_this_chunk = end - start
     print(f"Chunk finished in {elapsed:.1f}s ({elapsed/n_this_chunk:.1f}s/image avg for this chunk)")
@@ -355,8 +386,8 @@ if all_distortions:
     print(f'Avg L2 distortion      :    {np.mean(all_distortions):.4f}')
     print(f'Median L2 distortion   :    {np.median(all_distortions):.4f}')
     print(f'Avg Linf distortion    :    {np.mean(all_linf):.4f}')
-    print(f'Avg LPIPS              :    {np.mean(all_ssim):.4f}')
-    print(f'Avg SSIM               :    {np.mean(all_lpips):.4f}')
+    print(f'Avg LPIPS              :    {np.mean(all_lpips):.4f}')
+    print(f'Avg SSIM               :    {np.mean(all_ssim):.4f}')
     print(f'Avg PSNR               :    {np.mean(all_psnr):.2f} dB')
 else:
     print('No successful attacks -- no distortion/SSIM/PSNR stats to report.')
@@ -387,3 +418,4 @@ with open(adv_csv_path, 'w', newline='') as f:
 
 print(f'Original image labels saved to: {ori_csv_path}')
 print(f'Adversarial image labels saved to: {adv_csv_path}')
+print(f"Images finished in {total_elapsed:.1f}s")

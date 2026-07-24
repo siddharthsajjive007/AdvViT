@@ -13,7 +13,7 @@ from scipy.fftpack import dct, idct
 from numpy import linalg as LA
 
 
-DATASET = "GTSRB"       # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
+DATASET = "IMAGENET_3599"      # "CIFAR" | "IMAGENET" | "GTSRB" | "IMAGENET_3599"
 
 # mean and std for different datasets
 IMAGENET_SIZE = 224
